@@ -5,6 +5,32 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+/// What the shortcut does while the button is pressed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Mode {
+    /// Hold the shortcut down from button press to release.
+    #[default]
+    Hold,
+    /// Press the shortcut once on button press and once on release (for
+    /// apps that toggle).
+    TapBoth,
+    /// Press the shortcut once on button press only.
+    TapPress,
+}
+
+impl Mode {
+    pub const ALL: [Mode; 3] = [Mode::Hold, Mode::TapBoth, Mode::TapPress];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Mode::Hold => "Hold while button is down",
+            Mode::TapBoth => "Press on button down and up",
+            Mode::TapPress => "Press on button down only",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -14,6 +40,7 @@ pub struct Settings {
     pub channel: u32,
     /// Must match Handy's Transcribe Shortcut.
     pub hotkey: String,
+    pub mode: Mode,
     /// Treat downward thumps as presses.
     pub invert: bool,
     /// Start listening when the app opens.
@@ -30,6 +57,7 @@ impl Default for Settings {
             device: "Line 2 (Audient EVO4)".into(),
             channel: 1,
             hotkey: "ctrl+space".into(),
+            mode: Mode::Hold,
             invert: false,
             autostart: true,
             click_level: 0.3,

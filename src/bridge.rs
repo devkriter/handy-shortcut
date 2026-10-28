@@ -15,7 +15,7 @@ use cpal::{FromSample, Sample, SampleFormat, SizedSample};
 
 use crate::detector::{Detector, Params, Spike};
 use crate::keys::{self, Hotkey};
-use crate::settings::Settings;
+use crate::settings::{Mode, Settings};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Kind {
@@ -61,6 +61,16 @@ pub struct Bridge {
     worker: Option<JoinHandle<()>>,
     /// Loudest sample since the meter last looked, as f32 bits.
     peak: Arc<AtomicU32>,
+    /// The button is down (in every mode, not just Hold).
+    down: Arc<AtomicBool>,
+}
+
+/// What the worker needs to act on a thump.
+struct Action {
+    hotkey: Hotkey,
+    label: String,
+    mode: Mode,
+    down: Arc<AtomicBool>,
 }
 
 impl Bridge {
@@ -102,14 +112,15 @@ impl Bridge {
         stream.play().map_err(|e| e.to_string())?;
 
         let running = Arc::new(AtomicBool::new(true));
+        let down = Arc::new(AtomicBool::new(false));
         let worker = {
             let running = running.clone();
             let sink = sink.clone();
-            let label = s.hotkey.clone();
+            let action = Action { hotkey, label: s.hotkey.clone(), mode: s.mode, down: down.clone() };
             thread::spawn(move || {
                 while running.load(Ordering::Relaxed) {
                     match rx.recv_timeout(Duration::from_millis(200)) {
-                        Ok(spike) => handle(spike, &hotkey, &label, &sink),
+                        Ok(spike) => handle(spike, &action, &sink),
                         Err(RecvTimeoutError::Timeout) => continue,
                         Err(RecvTimeoutError::Disconnected) => break,
                     }
@@ -118,12 +129,16 @@ impl Bridge {
         };
 
         sink(Kind::Info, format!("Listening on {name} (channel {}/{nch})", ch + 1));
-        Ok(Bridge { stream: Some(stream), running, worker: Some(worker), peak })
+        Ok(Bridge { stream: Some(stream), running, worker: Some(worker), peak, down })
     }
 
     /// Loudest sample since the last call.
     pub fn take_peak(&self) -> f32 {
         f32::from_bits(self.peak.swap(0, Ordering::Relaxed))
+    }
+
+    pub fn button_down(&self) -> bool {
+        self.down.load(Ordering::Relaxed)
     }
 }
 
@@ -138,21 +153,40 @@ impl Drop for Bridge {
     }
 }
 
-fn handle(spike: Spike, hotkey: &Hotkey, label: &str, sink: &Sink) {
+fn handle(spike: Spike, a: &Action, sink: &Sink) {
     let info = format!(
         "{} spike, peak {:.2}, width {:.1} ms",
         if spike.up { '+' } else { '-' },
         spike.peak,
         spike.width_ms
     );
+    let (down, label) = (a.down.load(Ordering::Relaxed), &a.label);
     if !spike.ok {
         sink(Kind::Ignored, format!("ignored {info}"));
-    } else if spike.press && !keys::holding() {
-        keys::hold(hotkey);
-        sink(Kind::Down, format!("button DOWN -> holding {label}  ({info})"));
-    } else if !spike.press && keys::holding() {
-        keys::let_go();
-        sink(Kind::Up, format!("button UP -> released  ({info})"));
+    } else if spike.press && !down {
+        a.down.store(true, Ordering::Relaxed);
+        let did = if a.mode == Mode::Hold {
+            keys::hold(&a.hotkey);
+            format!("holding {label}")
+        } else {
+            keys::tap(&a.hotkey);
+            format!("pressed {label}")
+        };
+        sink(Kind::Down, format!("button DOWN -> {did}  ({info})"));
+    } else if !spike.press && down {
+        a.down.store(false, Ordering::Relaxed);
+        let did = match a.mode {
+            Mode::Hold => {
+                keys::let_go();
+                "released".to_string()
+            }
+            Mode::TapBoth => {
+                keys::tap(&a.hotkey);
+                format!("pressed {label}")
+            }
+            Mode::TapPress => "nothing to do".to_string(),
+        };
+        sink(Kind::Up, format!("button UP -> {did}  ({info})"));
     } else {
         let what = if spike.press { "press" } else { "release" };
         sink(Kind::Extra, format!("extra {what} thump, no change  ({info})"));

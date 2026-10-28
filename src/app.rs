@@ -21,7 +21,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 
 use crate::bridge::{self, Bridge, Kind, Sink};
 use crate::keys::{self, Hotkey};
-use crate::settings::{data_dir, Settings};
+use crate::settings::{data_dir, Mode, Settings};
 use crate::{icons, util, APP_NAME};
 
 const EM_SETSEL: u32 = 0x00B1;
@@ -61,6 +61,7 @@ pub struct App {
 
     hotkey: nwg::TextInput,
     rec_btn: nwg::Button,
+    mode: nwg::ComboBox<String>,
     device: nwg::ComboBox<String>,
     refresh_btn: nwg::Button,
     channel: nwg::TextInput,
@@ -133,7 +134,7 @@ impl App {
 
         nwg::Window::builder()
             .flags(nwg::WindowFlags::WINDOW | nwg::WindowFlags::MINIMIZE_BOX)
-            .size((560, 616))
+            .size((560, 652))
             .center(true)
             .title(APP_NAME)
             .icon(Some(&app.icons.app))
@@ -153,53 +154,59 @@ impl App {
         // settings
         let hf = Some(&app.header_font);
         label(w, &mut app.labels, "Settings", (16, 80), (300, 24), hf)?;
-        label(w, &mut app.labels, "Shortcut to hold", (16, 113), (130, 22), None)?;
+        label(w, &mut app.labels, "Shortcut", (16, 113), (130, 22), None)?;
         nwg::TextInput::builder().parent(w).text(&settings.hotkey).position((150, 110))
             .size((300, 26)).build(&mut app.hotkey)?;
         nwg::Button::builder().parent(w).text("Record...").position((458, 109)).size((86, 28))
             .build(&mut app.rec_btn)?;
 
-        label(w, &mut app.labels, "Microphone", (16, 149), (130, 22), None)?;
+        label(w, &mut app.labels, "Button action", (16, 149), (130, 22), None)?;
         nwg::ComboBox::builder().parent(w).position((150, 146)).size((300, 28))
+            .collection(Mode::ALL.iter().map(|m| m.label().to_string()).collect())
+            .selected_index(Mode::ALL.iter().position(|&m| m == settings.mode))
+            .build(&mut app.mode)?;
+
+        label(w, &mut app.labels, "Microphone", (16, 185), (130, 22), None)?;
+        nwg::ComboBox::builder().parent(w).position((150, 182)).size((300, 28))
             .build(&mut app.device)?;
-        nwg::Button::builder().parent(w).text("Refresh").position((458, 145)).size((86, 28))
+        nwg::Button::builder().parent(w).text("Refresh").position((458, 181)).size((86, 28))
             .build(&mut app.refresh_btn)?;
 
-        label(w, &mut app.labels, "Channel", (16, 185), (130, 22), None)?;
+        label(w, &mut app.labels, "Channel", (16, 221), (130, 22), None)?;
         nwg::TextInput::builder().parent(w).text(&settings.channel.to_string())
-            .position((150, 182)).size((50, 26)).build(&mut app.channel)?;
+            .position((150, 218)).size((50, 26)).build(&mut app.channel)?;
 
         nwg::CheckBox::builder().parent(w).text("Swap press / release (if they come out backwards)")
-            .position((16, 218)).size((528, 24)).check_state(checked(settings.invert))
+            .position((16, 254)).size((528, 24)).check_state(checked(settings.invert))
             .build(&mut app.invert)?;
         nwg::CheckBox::builder().parent(w).text("Start listening when the app opens")
-            .position((16, 244)).size((528, 24)).check_state(checked(settings.autostart))
+            .position((16, 280)).size((528, 24)).check_state(checked(settings.autostart))
             .build(&mut app.autostart)?;
         nwg::CheckBox::builder().parent(w).text("Start with Windows (in the tray)")
-            .position((16, 270)).size((528, 24)).check_state(checked(util::starts_with_windows()))
+            .position((16, 306)).size((528, 24)).check_state(checked(util::starts_with_windows()))
             .build(&mut app.startup)?;
 
         // advanced detection tuning
-        label(w, &mut app.labels, "Thump detection (advanced)", (16, 310), (400, 24), hf)?;
-        label(w, &mut app.labels, "Min peak (0-1)", (16, 343), (130, 22), None)?;
+        label(w, &mut app.labels, "Thump detection (advanced)", (16, 346), (400, 24), hf)?;
+        label(w, &mut app.labels, "Min peak (0-1)", (16, 379), (130, 22), None)?;
         nwg::TextInput::builder().parent(w).text(&settings.peak_min.to_string())
-            .position((150, 340)).size((60, 26)).build(&mut app.peak)?;
-        label(w, &mut app.labels, "Min width (ms)", (240, 343), (110, 22), None)?;
+            .position((150, 376)).size((60, 26)).build(&mut app.peak)?;
+        label(w, &mut app.labels, "Min width (ms)", (240, 379), (110, 22), None)?;
         nwg::TextInput::builder().parent(w).text(&settings.width_ms.to_string())
-            .position((356, 340)).size((60, 26)).build(&mut app.width)?;
+            .position((356, 376)).size((60, 26)).build(&mut app.width)?;
         label(
             w,
             &mut app.labels,
             "Your button's thumps: peak 1.00, width ~2.7 ms. Ignored spikes in the log show \
              what speech looks like.",
-            (16, 372),
+            (16, 408),
             (528, 40),
             None,
         )?;
 
         // log
-        label(w, &mut app.labels, "Activity", (16, 416), (300, 24), hf)?;
-        nwg::TextBox::builder().parent(w).position((16, 442)).size((528, 160))
+        label(w, &mut app.labels, "Activity", (16, 452), (300, 24), hf)?;
+        nwg::TextBox::builder().parent(w).position((16, 478)).size((528, 160))
             .font(Some(&app.mono_font)).readonly(true)
             .flags(nwg::TextBoxFlags::VISIBLE | nwg::TextBoxFlags::VSCROLL | nwg::TextBoxFlags::AUTOVSCROLL)
             .build(&mut app.log_box)?;
@@ -270,7 +277,11 @@ impl App {
                         app.toggle_startup();
                     }
                 }
-                E::OnComboxBoxSelection if handle == app.device.handle => app.apply_form(),
+                E::OnComboxBoxSelection
+                    if handle == app.device.handle || handle == app.mode.handle =>
+                {
+                    app.apply_form()
+                }
                 E::OnContextMenu if handle == app.tray.handle => app.show_menu(),
                 E::OnMousePress(nwg::MousePressEvent::MousePressLeftUp) if handle == app.tray.handle => {
                     app.show()
@@ -475,6 +486,7 @@ impl App {
             device: self.device.selection_string().unwrap_or_else(|| cur.device.clone()),
             channel: channel.max(1),
             hotkey,
+            mode: self.mode.selection().map_or(cur.mode, |i| Mode::ALL[i]),
             invert: is_checked(&self.invert),
             autostart: is_checked(&self.autostart),
             peak_min,
@@ -623,12 +635,15 @@ impl App {
     }
 
     fn refresh_status(&self) {
-        let (want, running, hotkey) = {
+        let (want, running, down, hotkey, mode) = {
             let st = self.state.borrow();
-            (st.want, st.bridge.is_some(), st.settings.hotkey.clone())
+            let down = st.bridge.as_ref().is_some_and(|b| b.button_down());
+            (st.want, st.bridge.is_some(), down, st.settings.hotkey.clone(), st.settings.mode)
         };
-        let (text, icon) = if running && keys::holding() {
+        let (text, icon) = if running && down && mode == Mode::Hold {
             (format!("Holding {hotkey}"), &self.icons.holding)
+        } else if running && down {
+            ("Button down".to_string(), &self.icons.holding)
         } else if running {
             ("Listening".to_string(), &self.icons.listening)
         } else if want {

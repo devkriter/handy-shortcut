@@ -145,15 +145,19 @@ pub fn hold(h: &Hotkey) {
     }
 }
 
+/// Press and release `h` once. The short gap lets apps that poll key state
+/// see it down.
+pub fn tap(h: &Hotkey) {
+    send(h.keys.iter().copied(), false);
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    send(h.keys.iter().rev().copied(), true);
+}
+
 /// Release the held shortcut, if any.
 pub fn let_go() {
     if let Some(h) = held().take() {
         send(h.keys.iter().rev().copied(), true);
     }
-}
-
-pub fn holding() -> bool {
-    held().is_some()
 }
 
 #[cfg(test)]
