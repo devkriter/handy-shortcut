@@ -1,0 +1,29 @@
+[package]
+name = "handy-shortcut"
+version = "1.0.0"
+edition = "2021"
+description = "Turn a microphone's hardware push-to-talk button into a held keyboard shortcut"
+
+[dependencies]
+cpal = "0.15"
+native-windows-gui = { version = "1.0.13", features = ["tray-notification", "menu", "notice", "animation-timer", "cursor", "high-dpi", "combobox", "progress-bar", "textbox"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Registry",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[build-dependencies]
+winresource = "0.1"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
