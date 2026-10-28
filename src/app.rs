@@ -64,6 +64,7 @@ pub struct App {
     mode: nwg::ComboBox<String>,
     device: nwg::ComboBox<String>,
     refresh_btn: nwg::Button,
+    save_btn: nwg::Button,
     channel: nwg::TextInput,
     invert: nwg::CheckBox,
     autostart: nwg::CheckBox,
@@ -154,6 +155,8 @@ impl App {
         // settings
         let hf = Some(&app.header_font);
         label(w, &mut app.labels, "Settings", (16, 80), (300, 24), hf)?;
+        nwg::Button::builder().parent(w).text("Save").position((458, 74)).size((86, 28))
+            .enabled(false).build(&mut app.save_btn)?;
         label(w, &mut app.labels, "Shortcut", (16, 113), (130, 22), None)?;
         nwg::TextInput::builder().parent(w).text(&settings.hotkey).position((150, 110))
             .size((300, 26)).build(&mut app.hotkey)?;
@@ -271,6 +274,8 @@ impl App {
                         app.begin_record();
                     } else if handle == app.refresh_btn.handle {
                         app.refresh_devices();
+                    } else if handle == app.save_btn.handle {
+                        app.save_clicked();
                     } else if handle == app.invert.handle || handle == app.autostart.handle {
                         app.apply_form();
                     } else if handle == app.startup.handle {
@@ -282,6 +287,7 @@ impl App {
                 {
                     app.apply_form()
                 }
+                E::OnTextInput if app.is_text_field(&handle) => app.update_save_btn(),
                 E::OnContextMenu if handle == app.tray.handle => app.show_menu(),
                 E::OnMousePress(nwg::MousePressEvent::MousePressLeftUp) if handle == app.tray.handle => {
                     app.show()
@@ -349,6 +355,27 @@ impl App {
             }
         });
         self.raw_handlers.borrow_mut().extend(raw.ok().into_iter().chain(rec.ok()));
+
+        // Enter in a text field saves (and doesn't beep).
+        let fields = [&self.hotkey.handle, &self.channel.handle, &self.peak.handle, &self.width.handle];
+        for (i, field) in fields.into_iter().enumerate() {
+            let weak = Rc::downgrade(self);
+            let enter = nwg::bind_raw_event_handler(field, 0x10010 + i, move |_, msg, wparam, _| {
+                let app = weak.upgrade()?;
+                if app.recording.get() || wparam != 0x0D {
+                    return None;
+                }
+                match msg {
+                    WM_KEYDOWN => {
+                        app.save_clicked();
+                        Some(0)
+                    }
+                    WM_CHAR => Some(0),
+                    _ => None,
+                }
+            });
+            self.raw_handlers.borrow_mut().extend(enter.ok());
+        }
     }
 
     // ---- listening ----------------------------------------------------------
@@ -380,6 +407,7 @@ impl App {
         }
         self.try_start();
         self.refresh_status();
+        self.update_save_btn();
     }
 
     fn try_start(&self) {
@@ -501,15 +529,34 @@ impl App {
         }
     }
 
-    /// Save the form and, if listening, restart with it.
+    /// Save the form if it's valid and, if listening, restart with it.
+    /// Used where an error box would be in the way (closing, quitting,
+    /// clicking a checkbox).
     fn apply_form(&self) {
-        let Some(s) = self.collect_form(true) else { return };
+        if let Some(s) = self.collect_form(true) {
+            self.apply(s);
+        }
+        self.update_save_btn();
+    }
+
+    /// The Save button, or Enter in a text field.
+    fn save_clicked(&self) {
+        if let Some(s) = self.collect_form(false) {
+            if self.apply(s) {
+                self.log(Kind::Info, "Settings saved");
+            }
+        }
+        self.update_save_btn();
+    }
+
+    /// Returns whether anything changed.
+    fn apply(&self, s: Settings) -> bool {
         let (changed, restart) = {
             let st = self.state.borrow();
             (st.settings != s, st.want && st.settings.listener_differs(&s))
         };
         if !changed {
-            return;
+            return false;
         }
         self.save(&s);
         self.state.borrow_mut().settings = s;
@@ -519,6 +566,22 @@ impl App {
             self.try_start();
             self.refresh_status();
         }
+        true
+    }
+
+    /// Enable Save only while the form differs from what's saved (or doesn't
+    /// parse, so clicking it explains why).
+    fn update_save_btn(&self) {
+        let dirty = match self.collect_form(true) {
+            Some(s) => s != self.state.borrow().settings,
+            None => true,
+        };
+        self.save_btn.set_enabled(dirty);
+    }
+
+    fn is_text_field(&self, h: &nwg::ControlHandle) -> bool {
+        [&self.hotkey.handle, &self.channel.handle, &self.peak.handle, &self.width.handle]
+            .contains(&h)
     }
 
     fn refresh_devices(&self) {
