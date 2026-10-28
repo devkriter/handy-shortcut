@@ -14,6 +14,8 @@ tray; closing the window hides it there.
 
 - **Button action:** hold the shortcut while the button is down, or press it
   once on button down and up (for toggle mode), or on button down only.
+- **Press Enter after** release sends the transcript, e.g. in Claude Code.
+  The delay gives Handy time to paste it first.
 - **Start with Windows** starts it in the tray at login.
 - If presses come out as releases, tick **Swap press / release**. If clicks
   show up as "ignored" in the Activity log, lower **Min peak** or **Min width**.

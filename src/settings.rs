@@ -43,6 +43,11 @@ pub struct Settings {
     pub mode: Mode,
     /// Treat downward thumps as presses.
     pub invert: bool,
+    /// Press Enter once the button is released and the shortcut has gone
+    /// out, e.g. to send the transcribed message in Claude Code.
+    pub enter_after: bool,
+    /// How long to wait before that Enter, so the transcript is in first.
+    pub enter_delay_ms: u32,
     /// Start listening when the app opens.
     pub autostart: bool,
     pub click_level: f32,
@@ -59,6 +64,8 @@ impl Default for Settings {
             hotkey: "ctrl+space".into(),
             mode: Mode::Hold,
             invert: false,
+            enter_after: false,
+            enter_delay_ms: 1000,
             autostart: true,
             click_level: 0.3,
             peak_min: 0.9,

@@ -1,6 +1,6 @@
 [package]
 name = "handy-shortcut"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "Turn a microphone's hardware push-to-talk button into a held keyboard shortcut"
 

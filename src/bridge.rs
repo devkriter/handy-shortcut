@@ -71,6 +71,9 @@ struct Action {
     label: String,
     mode: Mode,
     down: Arc<AtomicBool>,
+    /// Press Enter this long after a release, if set.
+    enter_after: Option<Duration>,
+    running: Arc<AtomicBool>,
 }
 
 impl Bridge {
@@ -116,7 +119,15 @@ impl Bridge {
         let worker = {
             let running = running.clone();
             let sink = sink.clone();
-            let action = Action { hotkey, label: s.hotkey.clone(), mode: s.mode, down: down.clone() };
+            let action = Action {
+                hotkey,
+                label: s.hotkey.clone(),
+                mode: s.mode,
+                down: down.clone(),
+                enter_after: (s.enter_after && s.mode != Mode::TapPress)
+                    .then(|| Duration::from_millis(s.enter_delay_ms as u64)),
+                running: running.clone(),
+            };
             thread::spawn(move || {
                 while running.load(Ordering::Relaxed) {
                     match rx.recv_timeout(Duration::from_millis(200)) {
@@ -187,10 +198,31 @@ fn handle(spike: Spike, a: &Action, sink: &Sink) {
             Mode::TapPress => "nothing to do".to_string(),
         };
         sink(Kind::Up, format!("button UP -> {did}  ({info})"));
+        if let Some(delay) = a.enter_after {
+            press_enter_later(delay, a, sink);
+        }
     } else {
         let what = if spike.press { "press" } else { "release" };
         sink(Kind::Extra, format!("extra {what} thump, no change  ({info})"));
     }
+}
+
+/// Press Enter after `delay` on its own thread, so thumps keep being handled
+/// meanwhile. Skipped if the button goes down again or listening stops first.
+fn press_enter_later(delay: Duration, a: &Action, sink: &Sink) {
+    let (down, running, sink) = (a.down.clone(), a.running.clone(), sink.clone());
+    thread::spawn(move || {
+        thread::sleep(delay);
+        if !running.load(Ordering::Relaxed) {
+            return;
+        }
+        if down.load(Ordering::Relaxed) {
+            sink(Kind::Info, "skipped enter, the button went down again".into());
+            return;
+        }
+        keys::tap(&Hotkey::parse("enter").expect("enter is a key"));
+        sink(Kind::Info, format!("pressed enter ({} ms after release)", delay.as_millis()));
+    });
 }
 
 /// Everything the audio callback owns.

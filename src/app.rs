@@ -62,6 +62,8 @@ pub struct App {
     hotkey: nwg::TextInput,
     rec_btn: nwg::Button,
     mode: nwg::ComboBox<String>,
+    enter_after: nwg::CheckBox,
+    enter_delay: nwg::TextInput,
     device: nwg::ComboBox<String>,
     refresh_btn: nwg::Button,
     save_btn: nwg::Button,
@@ -135,7 +137,7 @@ impl App {
 
         nwg::Window::builder()
             .flags(nwg::WindowFlags::WINDOW | nwg::WindowFlags::MINIMIZE_BOX)
-            .size((560, 652))
+            .size((560, 688))
             .center(true)
             .title(APP_NAME)
             .icon(Some(&app.icons.app))
@@ -169,47 +171,55 @@ impl App {
             .selected_index(Mode::ALL.iter().position(|&m| m == settings.mode))
             .build(&mut app.mode)?;
 
-        label(w, &mut app.labels, "Microphone", (16, 185), (130, 22), None)?;
-        nwg::ComboBox::builder().parent(w).position((150, 182)).size((300, 28))
+        label(w, &mut app.labels, "After release", (16, 185), (130, 22), None)?;
+        nwg::CheckBox::builder().parent(w).text("Press Enter after").position((150, 183))
+            .size((112, 24)).check_state(checked(settings.enter_after))
+            .build(&mut app.enter_after)?;
+        nwg::TextInput::builder().parent(w).text(&settings.enter_delay_ms.to_string())
+            .position((266, 182)).size((60, 26)).build(&mut app.enter_delay)?;
+        label(w, &mut app.labels, "ms (sends the message)", (332, 185), (212, 22), None)?;
+
+        label(w, &mut app.labels, "Microphone", (16, 221), (130, 22), None)?;
+        nwg::ComboBox::builder().parent(w).position((150, 218)).size((300, 28))
             .build(&mut app.device)?;
-        nwg::Button::builder().parent(w).text("Refresh").position((458, 181)).size((86, 28))
+        nwg::Button::builder().parent(w).text("Refresh").position((458, 217)).size((86, 28))
             .build(&mut app.refresh_btn)?;
 
-        label(w, &mut app.labels, "Channel", (16, 221), (130, 22), None)?;
+        label(w, &mut app.labels, "Channel", (16, 257), (130, 22), None)?;
         nwg::TextInput::builder().parent(w).text(&settings.channel.to_string())
-            .position((150, 218)).size((50, 26)).build(&mut app.channel)?;
+            .position((150, 254)).size((50, 26)).build(&mut app.channel)?;
 
         nwg::CheckBox::builder().parent(w).text("Swap press / release (if they come out backwards)")
-            .position((16, 254)).size((528, 24)).check_state(checked(settings.invert))
+            .position((16, 290)).size((528, 24)).check_state(checked(settings.invert))
             .build(&mut app.invert)?;
         nwg::CheckBox::builder().parent(w).text("Start listening when the app opens")
-            .position((16, 280)).size((528, 24)).check_state(checked(settings.autostart))
+            .position((16, 316)).size((528, 24)).check_state(checked(settings.autostart))
             .build(&mut app.autostart)?;
         nwg::CheckBox::builder().parent(w).text("Start with Windows (in the tray)")
-            .position((16, 306)).size((528, 24)).check_state(checked(util::starts_with_windows()))
+            .position((16, 342)).size((528, 24)).check_state(checked(util::starts_with_windows()))
             .build(&mut app.startup)?;
 
         // advanced detection tuning
-        label(w, &mut app.labels, "Thump detection (advanced)", (16, 346), (400, 24), hf)?;
-        label(w, &mut app.labels, "Min peak (0-1)", (16, 379), (130, 22), None)?;
+        label(w, &mut app.labels, "Thump detection (advanced)", (16, 382), (400, 24), hf)?;
+        label(w, &mut app.labels, "Min peak (0-1)", (16, 415), (130, 22), None)?;
         nwg::TextInput::builder().parent(w).text(&settings.peak_min.to_string())
-            .position((150, 376)).size((60, 26)).build(&mut app.peak)?;
-        label(w, &mut app.labels, "Min width (ms)", (240, 379), (110, 22), None)?;
+            .position((150, 412)).size((60, 26)).build(&mut app.peak)?;
+        label(w, &mut app.labels, "Min width (ms)", (240, 415), (110, 22), None)?;
         nwg::TextInput::builder().parent(w).text(&settings.width_ms.to_string())
-            .position((356, 376)).size((60, 26)).build(&mut app.width)?;
+            .position((356, 412)).size((60, 26)).build(&mut app.width)?;
         label(
             w,
             &mut app.labels,
             "Your button's thumps: peak 1.00, width ~2.7 ms. Ignored spikes in the log show \
              what speech looks like.",
-            (16, 408),
+            (16, 444),
             (528, 40),
             None,
         )?;
 
         // log
-        label(w, &mut app.labels, "Activity", (16, 452), (300, 24), hf)?;
-        nwg::TextBox::builder().parent(w).position((16, 478)).size((528, 160))
+        label(w, &mut app.labels, "Activity", (16, 488), (300, 24), hf)?;
+        nwg::TextBox::builder().parent(w).position((16, 514)).size((528, 160))
             .font(Some(&app.mono_font)).readonly(true)
             .flags(nwg::TextBoxFlags::VISIBLE | nwg::TextBoxFlags::VSCROLL | nwg::TextBoxFlags::AUTOVSCROLL)
             .build(&mut app.log_box)?;
@@ -276,7 +286,10 @@ impl App {
                         app.refresh_devices();
                     } else if handle == app.save_btn.handle {
                         app.save_clicked();
-                    } else if handle == app.invert.handle || handle == app.autostart.handle {
+                    } else if handle == app.invert.handle
+                        || handle == app.autostart.handle
+                        || handle == app.enter_after.handle
+                    {
                         app.apply_form();
                     } else if handle == app.startup.handle {
                         app.toggle_startup();
@@ -357,7 +370,13 @@ impl App {
         self.raw_handlers.borrow_mut().extend(raw.ok().into_iter().chain(rec.ok()));
 
         // Enter in a text field saves (and doesn't beep).
-        let fields = [&self.hotkey.handle, &self.channel.handle, &self.peak.handle, &self.width.handle];
+        let fields = [
+            &self.hotkey.handle,
+            &self.enter_delay.handle,
+            &self.channel.handle,
+            &self.peak.handle,
+            &self.width.handle,
+        ];
         for (i, field) in fields.into_iter().enumerate() {
             let weak = Rc::downgrade(self);
             let enter = nwg::bind_raw_event_handler(field, 0x10010 + i, move |_, msg, wparam, _| {
@@ -494,8 +513,10 @@ impl App {
         let channel = self.channel.text().trim().parse::<u32>();
         let peak = self.peak.text().trim().parse::<f32>();
         let width = self.width.text().trim().parse::<f32>();
-        let (Ok(channel), Ok(peak_min), Ok(width_ms)) = (channel, peak, width) else {
-            error("Channel, min peak and min width must be numbers.");
+        let delay = self.enter_delay.text().trim().parse::<u32>();
+        let (Ok(channel), Ok(peak_min), Ok(width_ms), Ok(enter_delay_ms)) = (channel, peak, width, delay)
+        else {
+            error("The Enter delay, channel, min peak and min width must be numbers.");
             return None;
         };
         let hotkey = if self.recording.get() {
@@ -516,6 +537,8 @@ impl App {
             hotkey,
             mode: self.mode.selection().map_or(cur.mode, |i| Mode::ALL[i]),
             invert: is_checked(&self.invert),
+            enter_after: is_checked(&self.enter_after),
+            enter_delay_ms,
             autostart: is_checked(&self.autostart),
             peak_min,
             width_ms,
@@ -580,8 +603,14 @@ impl App {
     }
 
     fn is_text_field(&self, h: &nwg::ControlHandle) -> bool {
-        [&self.hotkey.handle, &self.channel.handle, &self.peak.handle, &self.width.handle]
-            .contains(&h)
+        [
+            &self.hotkey.handle,
+            &self.enter_delay.handle,
+            &self.channel.handle,
+            &self.peak.handle,
+            &self.width.handle,
+        ]
+        .contains(&h)
     }
 
     fn refresh_devices(&self) {
