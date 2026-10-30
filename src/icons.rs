@@ -1,42 +1,30 @@
-//! Window and tray icons, one per state, drawn by art.rs at the size Windows
-//! wants for this display.
+//! Tray icons, one per state, drawn by art.rs. (The window uses the .exe's
+//! own icon; see util::set_window_icon.)
 
-use native_windows_gui as nwg;
-use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateIconFromResourceEx, GetSystemMetrics, SM_CXICON, SM_CXSMICON,
-};
+use tray_icon::Icon;
 
 use crate::art;
 
-#[derive(Default)]
+/// Tray icons are drawn at 32 px; Windows scales them to the tray size.
+const TRAY_SIZE: u32 = 32;
+
 pub struct Icons {
-    pub app: nwg::Icon,
-    pub app_small: nwg::Icon,
-    pub stopped: nwg::Icon,
-    pub listening: nwg::Icon,
-    pub holding: nwg::Icon,
-    pub error: nwg::Icon,
+    pub stopped: Icon,
+    pub listening: Icon,
+    pub holding: Icon,
+    pub error: Icon,
 }
 
-fn make(size: i32, color: [u8; 3]) -> nwg::Icon {
-    let bits = art::bmp_entry(size as u32, color);
-    let handle = unsafe {
-        CreateIconFromResourceEx(bits.as_ptr(), bits.len() as u32, 1, 0x0003_0000, size, size, 0)
-    };
-    let mut icon = nwg::Icon::default();
-    icon.handle = handle as _;
-    icon
+fn tray(color: [u8; 3]) -> Icon {
+    Icon::from_rgba(art::render(TRAY_SIZE, color), TRAY_SIZE, TRAY_SIZE)
+        .expect("tray icon pixels match their size")
 }
 
 pub fn load() -> Icons {
-    let big = unsafe { GetSystemMetrics(SM_CXICON) }.max(32);
-    let small = unsafe { GetSystemMetrics(SM_CXSMICON) }.max(16);
     Icons {
-        app: make(big, art::APP),
-        app_small: make(small, art::APP),
-        stopped: make(small, art::STOPPED),
-        listening: make(small, art::LISTENING),
-        holding: make(small, art::HOLDING),
-        error: make(small, art::ERROR),
+        stopped: tray(art::STOPPED),
+        listening: tray(art::LISTENING),
+        holding: tray(art::HOLDING),
+        error: tray(art::ERROR),
     }
 }

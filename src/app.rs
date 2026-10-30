@@ -1,8 +1,12 @@
-//! The settings window and tray icon.
+//! The settings window (Slint, ui/app.slint) and tray icon.
 //!
 //! Closing the window hides it to the tray; Quit is in the tray menu. While
 //! hidden nothing runs on the UI thread: the meter timer only ticks when the
-//! window is visible, and status changes arrive through a Notice.
+//! window is visible, and status changes arrive through invoke_from_event_loop.
+//!
+//! The App lives in a thread-local on the UI thread, so callbacks from the
+//! window, tray and other threads reach it with `with_app` instead of holding
+//! references to it.
 
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
@@ -12,26 +16,18 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use native_windows_gui as nwg;
-use windows_sys::Win32::UI::WindowsAndMessaging::{
-    GetWindowTextLengthW, SendMessageW, SetForegroundWindow, ShowWindow, ICON_SMALL, SW_RESTORE,
-    WM_CHAR, WM_ENDSESSION, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_QUERYENDSESSION, WM_SETICON,
-    WM_SYSCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP,
-};
+use slint::{ComponentHandle, Model, ModelRc, SharedString, Timer, TimerMode, VecModel};
+use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
+use tray_icon::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 use crate::bridge::{self, Bridge, Kind, Sink};
 use crate::keys::{self, Hotkey};
 use crate::settings::{data_dir, Mode, Settings};
 use crate::{icons, util, APP_NAME};
 
-const EM_SETSEL: u32 = 0x00B1;
-const EM_SCROLLCARET: u32 = 0x00B7;
-const EM_GETLINECOUNT: u32 = 0x00BA;
-const EM_LINEINDEX: u32 = 0x00BB;
-const EM_REPLACESEL: u32 = 0x00C2;
-const EM_SETLIMITTEXT: u32 = 0x00C5;
+slint::include_modules!();
 
-const MAX_LOG_LINES: isize = 500;
+const MAX_LOG_LINES: usize = 500;
 const MAX_LOG_FILE: u64 = 1 << 20;
 
 #[derive(Default)]
@@ -42,214 +38,104 @@ struct State {
     want: bool,
     /// Starting failed and the retry timer is running.
     retrying: bool,
-    /// What the status label/tray currently show, to skip no-op updates.
+    /// What the status text/tray currently show, to skip no-op updates.
     shown: String,
 }
 
-#[derive(Default)]
 pub struct App {
-    window: nwg::Window,
-    title_font: nwg::Font,
-    header_font: nwg::Font,
-    mono_font: nwg::Font,
-    labels: Vec<nwg::Label>,
+    ui: AppWindow,
+    tray: TrayIcon,
+    tray_icons: icons::Icons,
+    mi_open: MenuItem,
+    mi_listen: CheckMenuItem,
+    mi_quit: MenuItem,
 
-    status: nwg::Label,
-    level: nwg::ProgressBar,
-    db: nwg::Label,
-    run_btn: nwg::Button,
-
-    hotkey: nwg::TextInput,
-    rec_btn: nwg::Button,
-    mode: nwg::ComboBox<String>,
-    enter_after: nwg::CheckBox,
-    enter_delay: nwg::TextInput,
-    device: nwg::ComboBox<String>,
-    refresh_btn: nwg::Button,
-    save_btn: nwg::Button,
-    channel: nwg::TextInput,
-    invert: nwg::CheckBox,
-    autostart: nwg::CheckBox,
-    startup: nwg::CheckBox,
-    peak: nwg::TextInput,
-    width: nwg::TextInput,
-    log_box: nwg::TextBox,
-
-    tray: nwg::TrayNotification,
-    menu: nwg::Menu,
-    mi_open: nwg::MenuItem,
-    mi_listen: nwg::MenuItem,
-    mi_sep: nwg::MenuSeparator,
-    mi_quit: nwg::MenuItem,
-
-    notice: nwg::Notice,
-    meter_timer: nwg::AnimationTimer,
-    retry_timer: nwg::AnimationTimer,
-    icons: icons::Icons,
+    meter_timer: Timer,
+    retry_timer: Timer,
 
     state: RefCell<State>,
     logf: RefCell<Option<File>>,
+    log: Rc<VecModel<LogLine>>,
+    devices: RefCell<Vec<String>>,
     events: Arc<Mutex<VecDeque<(Kind, String)>>>,
     recording: Cell<bool>,
     hotkey_before: RefCell<String>,
-    handlers: RefCell<Vec<nwg::EventHandler>>,
-    raw_handlers: RefCell<Vec<nwg::RawEventHandler>>,
 }
 
-fn checked(b: bool) -> nwg::CheckBoxState {
-    if b { nwg::CheckBoxState::Checked } else { nwg::CheckBoxState::Unchecked }
+thread_local! {
+    static APP: RefCell<Option<Rc<App>>> = const { RefCell::new(None) };
 }
 
-fn is_checked(c: &nwg::CheckBox) -> bool {
-    c.check_state() == nwg::CheckBoxState::Checked
+/// Run `f` with the app, if it's been built (UI thread only).
+fn with_app(f: impl FnOnce(&App)) {
+    let app = APP.with(|a| a.borrow().clone());
+    if let Some(app) = app {
+        f(&app);
+    }
 }
 
-fn label(
-    parent: &nwg::Window,
-    out: &mut Vec<nwg::Label>,
-    text: &str,
-    pos: (i32, i32),
-    size: (i32, i32),
-    font: Option<&nwg::Font>,
-) -> Result<(), nwg::NwgError> {
-    let mut l = nwg::Label::default();
-    nwg::Label::builder().parent(parent).text(text).position(pos).size(size).font(font).build(&mut l)?;
-    out.push(l);
-    Ok(())
+/// Show the window; used when a second copy of the app is started.
+pub fn show_window() {
+    with_app(|app| app.show());
 }
 
-fn hwnd(handle: &nwg::ControlHandle) -> windows_sys::Win32::Foundation::HWND {
-    handle.hwnd().map(|h| h as _).unwrap_or(std::ptr::null_mut())
+fn kind_code(kind: Kind) -> i32 {
+    match kind {
+        Kind::Info => 0,
+        Kind::Down => 1,
+        Kind::Up => 2,
+        Kind::Ignored => 3,
+        Kind::Extra => 4,
+        Kind::Error | Kind::StreamError => 5,
+    }
 }
 
 impl App {
-    pub fn build(tray_only: bool) -> Result<Rc<App>, nwg::NwgError> {
+    pub fn build(tray_only: bool) -> Result<Rc<App>, String> {
         let settings = Settings::load();
-        let mut app = App::default();
-        app.icons = icons::load();
+        let ui = AppWindow::new().map_err(|e| e.to_string())?;
+        ui.set_version(env!("CARGO_PKG_VERSION").into());
+        let modes: Vec<SharedString> = Mode::ALL.iter().map(|m| m.label().into()).collect();
+        ui.set_modes(ModelRc::new(VecModel::from(modes)));
+        let log = Rc::new(VecModel::<LogLine>::default());
+        ui.set_log(ModelRc::from(log.clone()));
 
-        let mut font = nwg::Font::default();
-        nwg::Font::builder().family("Segoe UI").size(16).build(&mut font)?;
-        nwg::Font::set_global_default(Some(font));
-        nwg::Font::builder().family("Segoe UI").size(24).weight(700).build(&mut app.title_font)?;
-        nwg::Font::builder().family("Segoe UI").size(17).weight(700).build(&mut app.header_font)?;
-        nwg::Font::builder().family("Consolas").size(14).build(&mut app.mono_font)?;
+        let tray_icons = icons::load();
+        let mi_open = MenuItem::new("Open Handy Shortcut", true, None);
+        let mi_listen = CheckMenuItem::new("Listening", true, false, None);
+        let mi_quit = MenuItem::new("Quit", true, None);
+        let menu = Menu::new();
+        menu.append_items(&[&mi_open, &mi_listen, &PredefinedMenuItem::separator(), &mi_quit])
+            .map_err(|e| e.to_string())?;
+        let tray = TrayIconBuilder::new()
+            .with_icon(tray_icons.stopped.clone())
+            .with_tooltip(APP_NAME)
+            .with_menu(Box::new(menu))
+            .with_menu_on_left_click(false)
+            .build()
+            .map_err(|e| e.to_string())?;
 
-        nwg::Window::builder()
-            .flags(nwg::WindowFlags::WINDOW | nwg::WindowFlags::MINIMIZE_BOX)
-            .size((560, 688))
-            .center(true)
-            .title(APP_NAME)
-            .icon(Some(&app.icons.app))
-            .build(&mut app.window)?;
-        let w = &app.window;
+        let app = Rc::new(App {
+            ui,
+            tray,
+            tray_icons,
+            mi_open,
+            mi_listen,
+            mi_quit,
+            meter_timer: Timer::default(),
+            retry_timer: Timer::default(),
+            state: RefCell::new(State { settings: settings.clone(), ..State::default() }),
+            logf: RefCell::new(open_log_file()),
+            log,
+            devices: RefCell::new(Vec::new()),
+            events: Arc::new(Mutex::new(VecDeque::new())),
+            recording: Cell::new(false),
+            hotkey_before: RefCell::new(String::new()),
+        });
+        APP.with(|a| *a.borrow_mut() = Some(app.clone()));
 
-        // status + level
-        nwg::Label::builder().parent(w).text("Stopped").position((16, 12)).size((440, 30))
-            .font(Some(&app.title_font)).build(&mut app.status)?;
-        nwg::ProgressBar::builder().parent(w).position((16, 48)).size((360, 14)).range(0..90)
-            .build(&mut app.level)?;
-        nwg::Label::builder().parent(w).text("").position((384, 44)).size((76, 22))
-            .h_align(nwg::HTextAlign::Right).build(&mut app.db)?;
-        nwg::Button::builder().parent(w).text("Start").position((470, 16)).size((74, 44))
-            .build(&mut app.run_btn)?;
-
-        // settings
-        let hf = Some(&app.header_font);
-        label(w, &mut app.labels, "Settings", (16, 80), (300, 24), hf)?;
-        nwg::Button::builder().parent(w).text("Save").position((458, 74)).size((86, 28))
-            .enabled(false).build(&mut app.save_btn)?;
-        label(w, &mut app.labels, "Shortcut", (16, 113), (130, 22), None)?;
-        nwg::TextInput::builder().parent(w).text(&settings.hotkey).position((150, 110))
-            .size((300, 26)).build(&mut app.hotkey)?;
-        nwg::Button::builder().parent(w).text("Record...").position((458, 109)).size((86, 28))
-            .build(&mut app.rec_btn)?;
-
-        label(w, &mut app.labels, "Button action", (16, 149), (130, 22), None)?;
-        nwg::ComboBox::builder().parent(w).position((150, 146)).size((300, 28))
-            .collection(Mode::ALL.iter().map(|m| m.label().to_string()).collect())
-            .selected_index(Mode::ALL.iter().position(|&m| m == settings.mode))
-            .build(&mut app.mode)?;
-
-        label(w, &mut app.labels, "After release", (16, 185), (130, 22), None)?;
-        nwg::CheckBox::builder().parent(w).text("Press Enter after").position((150, 183))
-            .size((112, 24)).check_state(checked(settings.enter_after))
-            .build(&mut app.enter_after)?;
-        nwg::TextInput::builder().parent(w).text(&settings.enter_delay_ms.to_string())
-            .position((266, 182)).size((60, 26)).build(&mut app.enter_delay)?;
-        label(w, &mut app.labels, "ms (sends the message)", (332, 185), (212, 22), None)?;
-
-        label(w, &mut app.labels, "Microphone", (16, 221), (130, 22), None)?;
-        nwg::ComboBox::builder().parent(w).position((150, 218)).size((300, 28))
-            .build(&mut app.device)?;
-        nwg::Button::builder().parent(w).text("Refresh").position((458, 217)).size((86, 28))
-            .build(&mut app.refresh_btn)?;
-
-        label(w, &mut app.labels, "Channel", (16, 257), (130, 22), None)?;
-        nwg::TextInput::builder().parent(w).text(&settings.channel.to_string())
-            .position((150, 254)).size((50, 26)).build(&mut app.channel)?;
-
-        nwg::CheckBox::builder().parent(w).text("Swap press / release (if they come out backwards)")
-            .position((16, 290)).size((528, 24)).check_state(checked(settings.invert))
-            .build(&mut app.invert)?;
-        nwg::CheckBox::builder().parent(w).text("Start listening when the app opens")
-            .position((16, 316)).size((528, 24)).check_state(checked(settings.autostart))
-            .build(&mut app.autostart)?;
-        nwg::CheckBox::builder().parent(w).text("Start with Windows (in the tray)")
-            .position((16, 342)).size((528, 24)).check_state(checked(util::starts_with_windows()))
-            .build(&mut app.startup)?;
-
-        // advanced detection tuning
-        label(w, &mut app.labels, "Thump detection (advanced)", (16, 382), (400, 24), hf)?;
-        label(w, &mut app.labels, "Min peak (0-1)", (16, 415), (130, 22), None)?;
-        nwg::TextInput::builder().parent(w).text(&settings.peak_min.to_string())
-            .position((150, 412)).size((60, 26)).build(&mut app.peak)?;
-        label(w, &mut app.labels, "Min width (ms)", (240, 415), (110, 22), None)?;
-        nwg::TextInput::builder().parent(w).text(&settings.width_ms.to_string())
-            .position((356, 412)).size((60, 26)).build(&mut app.width)?;
-        label(
-            w,
-            &mut app.labels,
-            "Your button's thumps: peak 1.00, width ~2.7 ms. Ignored spikes in the log show \
-             what speech looks like.",
-            (16, 444),
-            (528, 40),
-            None,
-        )?;
-
-        // log
-        label(w, &mut app.labels, "Activity", (16, 488), (300, 24), hf)?;
-        nwg::TextBox::builder().parent(w).position((16, 514)).size((528, 160))
-            .font(Some(&app.mono_font)).readonly(true)
-            .flags(nwg::TextBoxFlags::VISIBLE | nwg::TextBoxFlags::VSCROLL | nwg::TextBoxFlags::AUTOVSCROLL)
-            .build(&mut app.log_box)?;
-
-        // tray
-        nwg::TrayNotification::builder().parent(w).icon(Some(&app.icons.stopped))
-            .tip(Some(APP_NAME)).build(&mut app.tray)?;
-        nwg::Menu::builder().popup(true).parent(w).build(&mut app.menu)?;
-        nwg::MenuItem::builder().text("Open Handy Shortcut").parent(&app.menu).build(&mut app.mi_open)?;
-        nwg::MenuItem::builder().text("Listening").parent(&app.menu).build(&mut app.mi_listen)?;
-        nwg::MenuSeparator::builder().parent(&app.menu).build(&mut app.mi_sep)?;
-        nwg::MenuItem::builder().text("Quit").parent(&app.menu).build(&mut app.mi_quit)?;
-
-        nwg::Notice::builder().parent(w).build(&mut app.notice)?;
-        nwg::AnimationTimer::builder().parent(w).interval(Duration::from_millis(50))
-            .build(&mut app.meter_timer)?;
-        nwg::AnimationTimer::builder().parent(w).interval(Duration::from_secs(3))
-            .build(&mut app.retry_timer)?;
-
-        *app.logf.borrow_mut() = open_log_file();
-        app.state.borrow_mut().settings = settings.clone();
-
-        let app = Rc::new(app);
+        app.load_form(&settings);
         app.bind_events();
-        unsafe {
-            SendMessageW(hwnd(&app.log_box.handle), EM_SETLIMITTEXT, 0, 0);
-            SendMessageW(hwnd(&app.window.handle), WM_SETICON, ICON_SMALL as usize,
-                         app.icons.app_small.handle as isize);
-        }
-
         util::refresh_startup_path();
         app.refresh_devices();
         app.log(Kind::Info, &format!("{APP_NAME} {} started", env!("CARGO_PKG_VERSION")));
@@ -258,142 +144,68 @@ impl App {
             app.try_start();
         }
         app.refresh_status();
+        app.update_save_btn();
         if !tray_only {
             app.show();
         }
         Ok(app)
     }
 
-    fn bind_events(self: &Rc<Self>) {
-        use nwg::Event as E;
+    fn load_form(&self, s: &Settings) {
+        let ui = &self.ui;
+        ui.set_hotkey(s.hotkey.as_str().into());
+        ui.set_mode_index(Mode::ALL.iter().position(|&m| m == s.mode).unwrap_or(0) as i32);
+        ui.set_enter_after(s.enter_after);
+        ui.set_enter_delay(s.enter_delay_ms.min(i32::MAX as u32) as i32);
+        ui.set_channel(s.channel.max(1) as i32);
+        ui.set_invert(s.invert);
+        ui.set_autostart(s.autostart);
+        ui.set_startup(util::starts_with_windows());
+        ui.set_peak_min(s.peak_min.to_string().into());
+        ui.set_width_ms(s.width_ms.to_string().into());
+    }
 
-        let weak = Rc::downgrade(self);
-        let handler = nwg::full_bind_event_handler(&self.window.handle, move |evt, data, handle| {
-            let Some(app) = weak.upgrade() else { return };
-            match evt {
-                E::OnWindowClose if handle == app.window.handle => {
-                    if let nwg::EventData::OnWindowClose(d) = &data {
-                        d.close(false);
-                    }
-                    app.hide();
-                }
-                E::OnButtonClick => {
-                    if handle == app.run_btn.handle {
-                        app.toggle();
-                    } else if handle == app.rec_btn.handle {
-                        app.begin_record();
-                    } else if handle == app.refresh_btn.handle {
-                        app.refresh_devices();
-                    } else if handle == app.save_btn.handle {
-                        app.save_clicked();
-                    } else if handle == app.invert.handle
-                        || handle == app.autostart.handle
-                        || handle == app.enter_after.handle
-                    {
-                        app.apply_form();
-                    } else if handle == app.startup.handle {
-                        app.toggle_startup();
-                    }
-                }
-                E::OnComboxBoxSelection
-                    if handle == app.device.handle || handle == app.mode.handle =>
-                {
-                    app.apply_form()
-                }
-                E::OnTextInput if app.is_text_field(&handle) => app.update_save_btn(),
-                E::OnContextMenu if handle == app.tray.handle => app.show_menu(),
-                E::OnMousePress(nwg::MousePressEvent::MousePressLeftUp) if handle == app.tray.handle => {
-                    app.show()
-                }
-                E::OnMenuItemSelected => {
-                    if handle == app.mi_open.handle {
-                        app.show();
-                    } else if handle == app.mi_listen.handle {
-                        app.toggle();
-                    } else if handle == app.mi_quit.handle {
-                        app.quit();
-                    }
-                }
-                E::OnNotice if handle == app.notice.handle => app.drain_events(),
-                E::OnTimerTick => {
-                    if handle == app.meter_timer.handle {
-                        app.update_meter();
-                    } else if handle == app.retry_timer.handle {
-                        app.retry();
-                    }
-                }
-                _ => {}
-            }
-        });
-        self.handlers.borrow_mut().push(handler);
+    fn bind_events(&self) {
+        let ui = &self.ui;
+        ui.on_toggle_listening(|| with_app(|a| a.toggle()));
+        ui.on_record(|| with_app(|a| a.record_clicked()));
+        ui.on_refresh_devices(|| with_app(|a| a.refresh_devices()));
+        ui.on_save(|| with_app(|a| a.save_clicked()));
+        ui.on_form_edited(|| with_app(|a| a.update_save_btn()));
+        ui.on_apply_now(|| with_app(|a| a.apply_form()));
+        ui.on_startup_toggled(|on| with_app(|a| a.toggle_startup(on)));
+        ui.on_open_log(|| with_app(|a| a.open_log()));
 
-        // Let go of the shortcut on log-off/shutdown, and show the window when
-        // a second copy is started.
-        let weak = Rc::downgrade(self);
-        let show_msg = util::show_message();
-        let raw = nwg::bind_raw_event_handler(&self.window.handle, 0x10001, move |_, msg, _, _| {
-            if msg == WM_QUERYENDSESSION || msg == WM_ENDSESSION {
-                keys::let_go();
-            } else if msg == show_msg {
-                if let Some(app) = weak.upgrade() {
-                    app.show();
-                }
-                return Some(0);
-            }
-            None
+        ui.window().on_close_requested(|| {
+            with_app(|a| a.hide());
+            slint::CloseRequestResponse::HideWindow
         });
-        // Record a shortcut by pressing it while the shortcut box has focus.
-        let weak = Rc::downgrade(self);
-        let rec = nwg::bind_raw_event_handler(&self.hotkey.handle, 0x10002, move |_, msg, wparam, _| {
-            let app = weak.upgrade()?;
-            if !app.recording.get() {
-                return None;
-            }
-            match msg {
-                WM_KEYDOWN | WM_SYSKEYDOWN => {
-                    let vk = wparam as u16;
-                    if vk == 0x1B {
-                        app.end_record(None);
-                    } else if !keys::is_modifier(vk) {
-                        app.end_record(Some(keys::combo_with(vk)));
-                    }
-                    Some(0)
-                }
-                WM_CHAR | WM_SYSCHAR | WM_KEYUP | WM_SYSKEYUP => Some(0),
-                WM_KILLFOCUS => {
-                    app.end_record(None);
-                    None
-                }
-                _ => None,
-            }
-        });
-        self.raw_handlers.borrow_mut().extend(raw.ok().into_iter().chain(rec.ok()));
 
-        // Enter in a text field saves (and doesn't beep).
-        let fields = [
-            &self.hotkey.handle,
-            &self.enter_delay.handle,
-            &self.channel.handle,
-            &self.peak.handle,
-            &self.width.handle,
-        ];
-        for (i, field) in fields.into_iter().enumerate() {
-            let weak = Rc::downgrade(self);
-            let enter = nwg::bind_raw_event_handler(field, 0x10010 + i, move |_, msg, wparam, _| {
-                let app = weak.upgrade()?;
-                if app.recording.get() || wparam != 0x0D {
-                    return None;
-                }
-                match msg {
-                    WM_KEYDOWN => {
-                        app.save_clicked();
-                        Some(0)
-                    }
-                    WM_CHAR => Some(0),
-                    _ => None,
-                }
-            });
-            self.raw_handlers.borrow_mut().extend(enter.ok());
+        // Tray and menu events come from the tray's own window procedure;
+        // hop onto the Slint event loop before touching the app.
+        TrayIconEvent::set_event_handler(Some(|e: TrayIconEvent| {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = e
+            {
+                let _ = slint::invoke_from_event_loop(show_window);
+            }
+        }));
+        MenuEvent::set_event_handler(Some(|e: MenuEvent| {
+            let id = e.id().clone();
+            let _ = slint::invoke_from_event_loop(move || with_app(|a| a.menu_clicked(&id)));
+        }));
+    }
+
+    fn menu_clicked(&self, id: &MenuId) {
+        if id == self.mi_open.id() {
+            self.show();
+        } else if id == self.mi_listen.id() {
+            self.toggle();
+        } else if id == self.mi_quit.id() {
+            self.quit();
         }
     }
 
@@ -401,10 +213,9 @@ impl App {
 
     fn sink(&self) -> Sink {
         let queue = self.events.clone();
-        let notice = self.notice.sender();
         Arc::new(move |kind, text| {
             queue.lock().unwrap_or_else(|e| e.into_inner()).push_back((kind, text));
-            notice.notice();
+            let _ = slint::invoke_from_event_loop(|| with_app(|a| a.drain_events()));
         })
     }
 
@@ -417,7 +228,14 @@ impl App {
     }
 
     fn start(&self) {
-        let Some(s) = self.collect_form(false) else { return };
+        let s = match self.collect_form() {
+            Ok(s) => s,
+            Err(e) => {
+                self.ui.set_form_error(e.into());
+                self.show();
+                return;
+            }
+        };
         self.save(&s);
         {
             let mut st = self.state.borrow_mut();
@@ -444,7 +262,11 @@ impl App {
                 if first {
                     self.log(Kind::Error, &format!("Couldn't start: {e}. Retrying every 3 seconds..."));
                 }
-                self.retry_timer.start();
+                if !self.retry_timer.running() {
+                    self.retry_timer.start(TimerMode::Repeated, Duration::from_secs(3), || {
+                        with_app(|a| a.retry())
+                    });
+                }
             }
         }
     }
@@ -502,44 +324,41 @@ impl App {
 
     // ---- form ---------------------------------------------------------------
 
-    /// Settings from the form, or None (with an error box unless quiet).
-    fn collect_form(&self, quiet: bool) -> Option<Settings> {
+    /// Settings from the form, or why they don't parse.
+    fn collect_form(&self) -> Result<Settings, String> {
+        let ui = &self.ui;
         let cur = self.state.borrow().settings.clone();
-        let error = |msg: &str| {
-            if !quiet {
-                nwg::modal_error_message(&self.window, APP_NAME, msg);
-            }
-        };
-        let channel = self.channel.text().trim().parse::<u32>();
-        let peak = self.peak.text().trim().parse::<f32>();
-        let width = self.width.text().trim().parse::<f32>();
-        let delay = self.enter_delay.text().trim().parse::<u32>();
-        let (Ok(channel), Ok(peak_min), Ok(width_ms), Ok(enter_delay_ms)) = (channel, peak, width, delay)
-        else {
-            error("The Enter delay, channel, min peak and min width must be numbers.");
-            return None;
+        let (Ok(peak_min), Ok(width_ms)) = (
+            ui.get_peak_min().trim().parse::<f32>(),
+            ui.get_width_ms().trim().parse::<f32>(),
+        ) else {
+            return Err("Min peak and min width must be numbers.".into());
         };
         let hotkey = if self.recording.get() {
             cur.hotkey.clone()
         } else {
-            self.hotkey.text().trim().to_lowercase()
+            ui.get_hotkey().trim().to_lowercase()
         };
         if let Err(e) = Hotkey::parse(&hotkey) {
-            error(&format!(
-                "'{hotkey}' isn't a shortcut I can press: {e}.\n\
-                 Use something like ctrl+space or ctrl+shift+f9."
-            ));
-            return None;
+            return Err(format!("'{hotkey}' isn't a shortcut I can press: {e}. Try ctrl+space."));
         }
-        Some(Settings {
-            device: self.device.selection_string().unwrap_or_else(|| cur.device.clone()),
-            channel: channel.max(1),
+        let device = usize::try_from(ui.get_device_index())
+            .ok()
+            .and_then(|i| self.devices.borrow().get(i).cloned())
+            .unwrap_or_else(|| cur.device.clone());
+        let mode = usize::try_from(ui.get_mode_index())
+            .ok()
+            .and_then(|i| Mode::ALL.get(i).copied())
+            .unwrap_or(cur.mode);
+        Ok(Settings {
+            device,
+            channel: ui.get_channel().max(1) as u32,
             hotkey,
-            mode: self.mode.selection().map_or(cur.mode, |i| Mode::ALL[i]),
-            invert: is_checked(&self.invert),
-            enter_after: is_checked(&self.enter_after),
-            enter_delay_ms,
-            autostart: is_checked(&self.autostart),
+            mode,
+            invert: ui.get_invert(),
+            enter_after: ui.get_enter_after(),
+            enter_delay_ms: ui.get_enter_delay().max(0) as u32,
+            autostart: ui.get_autostart(),
             peak_min,
             width_ms,
             ..cur
@@ -552,11 +371,10 @@ impl App {
         }
     }
 
-    /// Save the form if it's valid and, if listening, restart with it.
-    /// Used where an error box would be in the way (closing, quitting,
-    /// clicking a checkbox).
+    /// Save the form if it's valid and, if listening, restart with it. Used
+    /// for switches and dropdowns, which apply right away.
     fn apply_form(&self) {
-        if let Some(s) = self.collect_form(true) {
+        if let Ok(s) = self.collect_form() {
             self.apply(s);
         }
         self.update_save_btn();
@@ -564,10 +382,17 @@ impl App {
 
     /// The Save button, or Enter in a text field.
     fn save_clicked(&self) {
-        if let Some(s) = self.collect_form(false) {
-            if self.apply(s) {
-                self.log(Kind::Info, "Settings saved");
+        if self.recording.get() {
+            return;
+        }
+        match self.collect_form() {
+            Ok(s) => {
+                if self.apply(s) {
+                    self.log(Kind::Info, "Settings saved");
+                }
+                self.ui.set_form_error(SharedString::new());
             }
+            Err(e) => self.ui.set_form_error(e.into()),
         }
         self.update_save_btn();
     }
@@ -593,24 +418,16 @@ impl App {
     }
 
     /// Enable Save only while the form differs from what's saved (or doesn't
-    /// parse, so clicking it explains why).
+    /// parse, so clicking it explains why). A fixed field clears the error.
     fn update_save_btn(&self) {
-        let dirty = match self.collect_form(true) {
-            Some(s) => s != self.state.borrow().settings,
-            None => true,
+        let dirty = match self.collect_form() {
+            Ok(s) => {
+                self.ui.set_form_error(SharedString::new());
+                s != self.state.borrow().settings
+            }
+            Err(_) => true,
         };
-        self.save_btn.set_enabled(dirty);
-    }
-
-    fn is_text_field(&self, h: &nwg::ControlHandle) -> bool {
-        [
-            &self.hotkey.handle,
-            &self.enter_delay.handle,
-            &self.channel.handle,
-            &self.peak.handle,
-            &self.width.handle,
-        ]
-        .contains(&h)
+        self.ui.set_dirty(dirty);
     }
 
     fn refresh_devices(&self) {
@@ -621,10 +438,10 @@ impl App {
                 return;
             }
         };
-        let want = self
-            .device
-            .selection_string()
-            .unwrap_or_else(|| self.state.borrow().settings.device.clone());
+        let current = usize::try_from(self.ui.get_device_index())
+            .ok()
+            .and_then(|i| self.devices.borrow().get(i).cloned());
+        let want = current.unwrap_or_else(|| self.state.borrow().settings.device.clone());
         let lw = want.to_lowercase();
         let mut sel = names.iter().position(|n| *n == want)
             .or_else(|| names.iter().position(|n| n.to_lowercase().contains(&lw)));
@@ -633,82 +450,105 @@ impl App {
             names.push(want); // keep the saved choice even while it's unplugged
             sel = Some(names.len() - 1);
         }
-        self.device.set_collection(names);
-        self.device.set_selection(sel);
+        let model: Vec<SharedString> = names.iter().map(|n| n.as_str().into()).collect();
+        self.ui.set_devices(ModelRc::new(VecModel::from(model)));
+        self.ui.set_device_index(sel.map_or(-1, |i| i as i32));
+        *self.devices.borrow_mut() = names;
     }
 
-    fn begin_record(&self) {
-        *self.hotkey_before.borrow_mut() = self.hotkey.text();
+    fn record_clicked(&self) {
+        if self.recording.get() {
+            keys::cancel_record();
+            return;
+        }
+        let done = |combo: Option<String>| {
+            // Runs inside the keyboard hook; finish once it has returned.
+            Timer::single_shot(Duration::ZERO, move || with_app(|a| a.end_record(combo)));
+        };
+        if let Err(e) = keys::record(done) {
+            self.log(Kind::Error, &format!("Couldn't record a shortcut: {e}"));
+            return;
+        }
+        *self.hotkey_before.borrow_mut() = self.ui.get_hotkey().to_string();
         self.recording.set(true);
-        self.hotkey.set_text("Press the shortcut... (Esc cancels)");
-        self.hotkey.set_focus();
-        self.rec_btn.set_enabled(false);
+        self.ui.set_recording(true);
+        self.ui.set_hotkey("Press the shortcut... (Esc cancels)".into());
     }
 
     fn end_record(&self, combo: Option<String>) {
         self.recording.set(false);
-        self.rec_btn.set_enabled(true);
+        self.ui.set_recording(false);
         match combo {
             Some(c) => {
-                self.hotkey.set_text(&c);
+                self.ui.set_hotkey(c.as_str().into());
                 self.log(Kind::Info, &format!("Shortcut set to {c}"));
                 self.apply_form();
             }
-            None => self.hotkey.set_text(&self.hotkey_before.borrow()),
+            None => self.ui.set_hotkey(self.hotkey_before.borrow().as_str().into()),
         }
     }
 
-    fn toggle_startup(&self) {
-        let on = is_checked(&self.startup);
+    fn toggle_startup(&self, on: bool) {
         match util::set_start_with_windows(on) {
             Ok(()) if on => self.log(Kind::Info, "Will start with Windows, in the tray"),
             Ok(()) => self.log(Kind::Info, "Won't start with Windows"),
             Err(e) => {
                 self.log(Kind::Error, &format!("Couldn't change start with Windows: {e}"));
-                self.startup.set_check_state(checked(!on));
+                self.ui.set_startup(!on);
             }
+        }
+    }
+
+    fn open_log(&self) {
+        let path = data_dir().join("handy_shortcut.log");
+        if let Err(e) = std::process::Command::new("explorer").arg(&path).spawn() {
+            self.log(Kind::Error, &format!("Couldn't open {}: {e}", path.display()));
         }
     }
 
     // ---- window -------------------------------------------------------------
 
     fn show(&self) {
-        self.window.set_visible(true);
-        let h = hwnd(&self.window.handle);
-        unsafe {
-            ShowWindow(h, SW_RESTORE);
-            SetForegroundWindow(h);
+        if let Err(e) = self.ui.show() {
+            self.log(Kind::Error, &format!("Couldn't show the window: {e}"));
+            return;
         }
-        self.meter_timer.start();
+        finish_show(10);
+        if !self.meter_timer.running() {
+            self.meter_timer.start(TimerMode::Repeated, Duration::from_millis(50), || {
+                with_app(|a| a.update_meter())
+            });
+        }
+        self.scroll_log_soon();
     }
 
+    /// The window is closing to the tray.
     fn hide(&self) {
         if self.recording.get() {
-            self.end_record(None);
+            keys::cancel_record();
         }
         self.apply_form();
-        self.window.set_visible(false);
         self.meter_timer.stop();
-        self.level.set_pos(0);
-        self.db.set_text("");
-    }
-
-    fn show_menu(&self) {
-        unsafe { SetForegroundWindow(hwnd(&self.window.handle)) };
-        let (x, y) = nwg::GlobalCursor::position();
-        self.menu.popup(x, y);
+        self.ui.set_level(0.0);
+        self.ui.set_level_text(SharedString::new());
     }
 
     fn quit(&self) {
+        if self.recording.get() {
+            keys::cancel_record();
+        }
         self.apply_form();
         self.stop_bridge();
         keys::let_go();
-        nwg::stop_thread_dispatch();
+        let _ = self.ui.hide();
+        let _ = slint::quit_event_loop();
     }
 
     pub fn shutdown(&self) {
         self.stop_bridge();
         keys::let_go();
+        let _ = self.tray.set_visible(false);
+        APP.with(|a| a.borrow_mut().take());
     }
 
     fn update_meter(&self) {
@@ -716,12 +556,12 @@ impl App {
         match peak {
             Some(p) => {
                 let db = 20.0 * p.max(1e-10).log10();
-                self.level.set_pos((db + 90.0).clamp(0.0, 90.0) as u32);
-                self.db.set_text(&format!("{db:.1} dB"));
+                self.ui.set_level(((db + 90.0) / 90.0).clamp(0.0, 1.0));
+                self.ui.set_level_text(format!("{db:.1} dB").into());
             }
             None => {
-                self.level.set_pos(0);
-                self.db.set_text("");
+                self.ui.set_level(0.0);
+                self.ui.set_level_text(SharedString::new());
             }
         }
     }
@@ -732,53 +572,66 @@ impl App {
             let down = st.bridge.as_ref().is_some_and(|b| b.button_down());
             (st.want, st.bridge.is_some(), down, st.settings.hotkey.clone(), st.settings.mode)
         };
-        let (text, icon) = if running && down && mode == Mode::Hold {
-            (format!("Holding {hotkey}"), &self.icons.holding)
+        let (text, kind, icon) = if running && down && mode == Mode::Hold {
+            (format!("Holding {hotkey}"), 2, &self.tray_icons.holding)
         } else if running && down {
-            ("Button down".to_string(), &self.icons.holding)
+            ("Button down".to_string(), 2, &self.tray_icons.holding)
         } else if running {
-            ("Listening".to_string(), &self.icons.listening)
+            ("Listening".to_string(), 1, &self.tray_icons.listening)
         } else if want {
-            ("Waiting for the microphone...".to_string(), &self.icons.error)
+            ("Waiting for the microphone...".to_string(), 3, &self.tray_icons.error)
         } else {
-            ("Stopped".to_string(), &self.icons.stopped)
+            ("Stopped".to_string(), 0, &self.tray_icons.stopped)
         };
+        self.ui.set_listening(want);
+        self.mi_listen.set_checked(want);
         if self.state.borrow().shown == text {
             return;
         }
-        self.status.set_text(&text);
-        self.tray.set_icon(icon);
-        self.tray.set_tip(&format!("{APP_NAME} - {text}"));
-        self.run_btn.set_text(if want { "Stop" } else { "Start" });
-        self.mi_listen.set_checked(want);
+        self.ui.set_status_text(text.as_str().into());
+        self.ui.set_status_kind(kind);
+        let _ = self.tray.set_icon(Some(icon.clone()));
+        let _ = self.tray.set_tooltip(Some(format!("{APP_NAME} - {text}")));
         self.state.borrow_mut().shown = text;
     }
 
     // ---- log ----------------------------------------------------------------
 
-    fn log(&self, _kind: Kind, text: &str) {
+    fn log(&self, kind: Kind, text: &str) {
         let (date, time) = util::now();
-        let line = format!("[{time}] {text}");
         if let Some(f) = self.logf.borrow_mut().as_mut() {
-            let _ = writeln!(f, "{date} {line}");
+            let _ = writeln!(f, "{date} [{time}] {text}");
         }
-        let h = hwnd(&self.log_box.handle);
-        let replace = |s: &str| {
-            let w = util::wide(s);
-            unsafe { SendMessageW(h, EM_REPLACESEL, 0, w.as_ptr() as isize) };
-        };
-        unsafe {
-            if SendMessageW(h, EM_GETLINECOUNT, 0, 0) > MAX_LOG_LINES {
-                let cut = SendMessageW(h, EM_LINEINDEX, 100, 0);
-                SendMessageW(h, EM_SETSEL, 0, cut);
-                replace("");
-            }
-            let len = GetWindowTextLengthW(h);
-            SendMessageW(h, EM_SETSEL, len as usize, len as isize);
-            replace(&format!("{line}\r\n"));
-            SendMessageW(h, EM_SCROLLCARET, 0, 0);
+        if self.log.row_count() >= MAX_LOG_LINES {
+            let keep: Vec<LogLine> = self.log.iter().skip(100).collect();
+            self.log.set_vec(keep);
         }
+        self.log.push(LogLine { time: time.into(), text: text.into(), kind: kind_code(kind) });
+        self.scroll_log_soon();
     }
+
+    /// Scroll the activity list to the newest line once it's been laid out.
+    fn scroll_log_soon(&self) {
+        Timer::single_shot(Duration::from_millis(10), || {
+            with_app(|a| a.ui.invoke_scroll_log_to_end())
+        });
+    }
+}
+
+/// Set the window's icon and bring it to the front. The native window only
+/// exists once the event loop has handled the show, so look for it from
+/// there, a few times if need be.
+fn finish_show(tries: u32) {
+    Timer::single_shot(Duration::from_millis(50), move || {
+        match util::own_window(APP_NAME) {
+            Some(hwnd) => {
+                util::set_window_icon(hwnd);
+                util::bring_to_front(hwnd);
+            }
+            None if tries > 1 => finish_show(tries - 1),
+            None => {}
+        }
+    });
 }
 
 fn open_log_file() -> Option<File> {

@@ -17,13 +17,17 @@ tray; closing the window hides it there.
 - **Press Enter after** release sends the transcript, e.g. in Claude Code.
   The delay gives Handy time to paste it first.
 - **Start with Windows** starts it in the tray at login.
-- If presses come out as releases, tick **Swap press / release**. If clicks
-  show up as "ignored" in the Activity log, lower **Min peak** or **Min width**.
+- If presses come out as releases, turn on **Swap press and release**. If
+  clicks show up as "ignored" in the Activity list, lower **Min peak** or
+  **Min width**.
 
-Tested with the handy microphone through an Audient EVO4 on Windows 11.
-Settings and the log are in `%APPDATA%\Handy Shortcut\`.
+The window follows the Windows light/dark setting. Tested with the handy
+microphone through an Audient EVO4 on Windows 11. Settings and the log are in
+`%APPDATA%\Handy Shortcut\`.
 
 ## Build
 
 Needs [Rust](https://rustup.rs) and the Visual Studio C++ Build Tools.
 `.\build.ps1` builds `dist\Handy Shortcut.exe`; add `-Test` to run the tests.
+The window is written in [Slint](https://slint.dev) (`ui/app.slint`, Fluent
+style); the tray icon uses `tray-icon`.

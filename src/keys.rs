@@ -1,10 +1,18 @@
-//! Parsing shortcuts like "ctrl+space" and holding them down system-wide.
+//! Parsing shortcuts like "ctrl+space", holding them down system-wide, and
+//! recording one from the keyboard.
 
+use std::cell::RefCell;
 use std::sync::Mutex;
 
+use windows_sys::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
+use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, MapVirtualKeyW, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT,
+    GetAsyncKeyState, MapVirtualKeyW, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT,
     KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, MAPVK_VK_TO_VSC,
+};
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    CallNextHookEx, SetWindowsHookExW, UnhookWindowsHookEx, HHOOK, KBDLLHOOKSTRUCT,
+    WH_KEYBOARD_LL, WM_KEYDOWN, WM_SYSKEYDOWN,
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -98,7 +106,7 @@ impl Hotkey {
 
 /// The shortcut being pressed right now, ending in `vk`, as "ctrl+shift+f9".
 pub fn combo_with(vk: u16) -> String {
-    let down = |k: i32| unsafe { GetKeyState(k) } < 0;
+    let down = |k: i32| unsafe { GetAsyncKeyState(k) } < 0;
     let mut parts = Vec::new();
     if down(0x11) { parts.push("ctrl".to_string()); }
     if down(0x10) { parts.push("shift".to_string()); }
@@ -158,6 +166,55 @@ pub fn let_go() {
     if let Some(h) = held().take() {
         send(h.keys.iter().rev().copied(), true);
     }
+}
+
+// ---- recording a shortcut --------------------------------------------------
+
+type Done = Box<dyn FnOnce(Option<String>)>;
+
+thread_local! {
+    static RECORDING: RefCell<Option<(HHOOK, Done)>> = const { RefCell::new(None) };
+}
+
+/// Capture the next shortcut pressed anywhere, without passing its keys on.
+/// `done` gets e.g. `Some("ctrl+shift+f9")`, or `None` for Esc or
+/// `cancel_record`. It runs inside the keyboard hook, so it should only
+/// schedule work. Call from a thread with a message loop (the UI thread).
+pub fn record(done: impl FnOnce(Option<String>) + 'static) -> Result<(), String> {
+    cancel_record();
+    let hook = unsafe {
+        SetWindowsHookExW(WH_KEYBOARD_LL, Some(record_hook), GetModuleHandleW(std::ptr::null()), 0)
+    };
+    if hook.is_null() {
+        return Err("couldn't watch the keyboard".into());
+    }
+    RECORDING.with(|r| *r.borrow_mut() = Some((hook, Box::new(done))));
+    Ok(())
+}
+
+pub fn cancel_record() {
+    finish_record(None);
+}
+
+fn finish_record(combo: Option<String>) {
+    if let Some((hook, done)) = RECORDING.with(|r| r.borrow_mut().take()) {
+        unsafe { UnhookWindowsHookEx(hook) };
+        done(combo);
+    }
+}
+
+unsafe extern "system" fn record_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if code >= 0 {
+        let vk = (*(lparam as *const KBDLLHOOKSTRUCT)).vkCode as u16;
+        let down = wparam == WM_KEYDOWN as WPARAM || wparam == WM_SYSKEYDOWN as WPARAM;
+        if !is_modifier(vk) {
+            if down {
+                finish_record(if vk == 0x1B { None } else { Some(combo_with(vk)) });
+            }
+            return 1; // swallow it, so the shortcut doesn't also do something
+        }
+    }
+    CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam)
 }
 
 #[cfg(test)]

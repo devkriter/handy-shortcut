@@ -6,20 +6,25 @@ description = "Turn a microphone's hardware push-to-talk button into a held keyb
 
 [dependencies]
 cpal = "0.15"
-native-windows-gui = { version = "1.0.13", features = ["tray-notification", "menu", "notice", "animation-timer", "cursor", "high-dpi", "combobox", "progress-bar", "textbox"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+slint = "1.18"
+tray-icon = "0.26"
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
+    "Win32_Graphics_Gdi",
     "Win32_Security",
+    "Win32_System_LibraryLoader",
     "Win32_System_Registry",
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
+    "Win32_UI_HiDpi",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
 ] }
 
 [build-dependencies]
+slint-build = "1.18"
 winresource = "0.1"
 
 [profile.release]

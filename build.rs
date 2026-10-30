@@ -1,5 +1,6 @@
-//! Draws the app icon and embeds it, the version info and the manifest
-//! (modern controls, DPI awareness) into the .exe.
+//! Compiles the Slint UI (Fluent style), draws the app icon and embeds it,
+//! the version info and the manifest (per-monitor DPI awareness) into the
+//! .exe.
 
 #[path = "src/art.rs"]
 mod art;
@@ -20,7 +21,8 @@ const MANIFEST: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?
   </trustInfo>
   <application xmlns="urn:schemas-microsoft-com:asm.v3">
     <windowsSettings>
-      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true</dpiAware>
+      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/pm</dpiAware>
+      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2</dpiAwareness>
     </windowsSettings>
   </application>
   <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
@@ -30,6 +32,9 @@ const MANIFEST: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?
 "#;
 
 fn main() {
+    let config = slint_build::CompilerConfiguration::new().with_style("fluent".into());
+    slint_build::compile_with_config("ui/app.slint", config).expect("compiling ui/app.slint");
+
     println!("cargo:rerun-if-changed=src/art.rs");
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;

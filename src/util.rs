@@ -1,17 +1,24 @@
-//! Small Windows helpers: wide strings, local time, run-at-login and
-//! single-instance handling.
+//! Small Windows helpers: wide strings, local time, run-at-login,
+//! single-instance and session-end handling.
 
 use std::sync::OnceLock;
 
-use windows_sys::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS, SYSTEMTIME};
+use windows_sys::Win32::Foundation::{
+    GetLastError, BOOL, ERROR_ALREADY_EXISTS, HWND, LPARAM, LRESULT, SYSTEMTIME, WPARAM,
+};
+use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Registry::{
     RegDeleteKeyValueW, RegGetValueW, RegSetKeyValueW, HKEY_CURRENT_USER, REG_SZ, RRF_RT_REG_SZ,
 };
 use windows_sys::Win32::System::SystemInformation::GetLocalTime;
-use windows_sys::Win32::System::Threading::CreateMutexW;
+use windows_sys::Win32::System::Threading::{CreateMutexW, GetCurrentProcessId};
+use windows_sys::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    AllowSetForegroundWindow, FindWindowW, GetWindowThreadProcessId, PostMessageW,
-    RegisterWindowMessageW,
+    AllowSetForegroundWindow, CreateWindowExW, DefWindowProcW, DispatchMessageW, EnumWindows,
+    FindWindowW, GetMessageW, GetWindowTextW, GetWindowThreadProcessId, LoadImageW, PostMessageW, RegisterClassW,
+    RegisterWindowMessageW, SendMessageW, SetClassLongPtrW, SetForegroundWindow, ShowWindow,
+    TranslateMessage, GCLP_HICON, GCLP_HICONSM, ICON_BIG, ICON_SMALL, IMAGE_ICON, MSG, SM_CXICON, SM_CXSMICON, SW_RESTORE, WM_ENDSESSION,
+    WM_QUERYENDSESSION, WM_SETICON, WNDCLASSW, WS_OVERLAPPED,
 };
 
 use crate::APP_NAME;
@@ -97,12 +104,78 @@ pub fn refresh_startup_path() {
     }
 }
 
-// ---- single instance -------------------------------------------------------
+// ---- single instance and session end ---------------------------------------
+
+/// Class of the hidden window that a second copy talks to.
+const SESSION_CLASS: &str = "HandyShortcut.Session";
 
 /// Message that asks the running copy to show its window.
-pub fn show_message() -> u32 {
+fn show_message() -> u32 {
     static MSG: OnceLock<u32> = OnceLock::new();
     *MSG.get_or_init(|| unsafe { RegisterWindowMessageW(wide("HandyShortcut.Show").as_ptr()) })
+}
+
+static ON_SHOW: OnceLock<Box<dyn Fn() + Send + Sync>> = OnceLock::new();
+
+/// Start a hidden top-level window on its own thread. It lets go of the
+/// shortcut at log-off/shutdown (only top-level windows are told about that)
+/// and calls `on_show` when a second copy of the app is started.
+pub fn spawn_session_window(on_show: impl Fn() + Send + Sync + 'static) {
+    let _ = ON_SHOW.set(Box::new(on_show));
+    std::thread::spawn(|| unsafe {
+        let class = wide(SESSION_CLASS);
+        let instance = GetModuleHandleW(std::ptr::null());
+        let wc = WNDCLASSW {
+            lpfnWndProc: Some(session_proc),
+            hInstance: instance,
+            lpszClassName: class.as_ptr(),
+            ..std::mem::zeroed()
+        };
+        RegisterClassW(&wc);
+        let title = wide("Handy Shortcut session");
+        let hwnd = CreateWindowExW(
+            0,
+            class.as_ptr(),
+            title.as_ptr(),
+            WS_OVERLAPPED,
+            0,
+            0,
+            0,
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            instance,
+            std::ptr::null(),
+        );
+        if hwnd.is_null() {
+            return;
+        }
+        let mut msg: MSG = std::mem::zeroed();
+        while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    });
+}
+
+unsafe extern "system" fn session_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    match msg {
+        WM_QUERYENDSESSION => {
+            crate::keys::let_go();
+            1
+        }
+        WM_ENDSESSION => {
+            crate::keys::let_go();
+            0
+        }
+        m if m == show_message() => {
+            if let Some(f) = ON_SHOW.get() {
+                f();
+            }
+            0
+        }
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
 }
 
 /// True if this is the only copy running. The mutex is kept for the life of
@@ -115,11 +188,65 @@ pub fn claim_single_instance() -> bool {
     }
 }
 
+/// This process's top-level window titled `title`, if any.
+pub fn own_window(title: &str) -> Option<isize> {
+    struct Search {
+        title: Vec<u16>,
+        found: HWND,
+    }
+    unsafe extern "system" fn check(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let search = &mut *(lparam as *mut Search);
+        let mut pid = 0;
+        GetWindowThreadProcessId(hwnd, &mut pid);
+        let mut buf = [0u16; 128];
+        let len = GetWindowTextW(hwnd, buf.as_mut_ptr(), buf.len() as i32) as usize;
+        if pid == GetCurrentProcessId() && buf[..len] == search.title[..] {
+            search.found = hwnd;
+            return 0; // stop
+        }
+        1
+    }
+    let mut search = Search { title: title.encode_utf16().collect(), found: std::ptr::null_mut() };
+    unsafe { EnumWindows(Some(check), &mut search as *mut Search as LPARAM) };
+    (!search.found.is_null()).then_some(search.found as isize)
+}
+
+/// Give `hwnd` the .exe's own icon (embedded by build.rs) at the sizes its
+/// monitor wants. It's set on the window class too: the UI toolkit resets
+/// the window's own icon when it updates the window, and Windows then falls
+/// back to the class icon.
+pub fn set_window_icon(hwnd: isize) {
+    let hwnd = hwnd as HWND;
+    unsafe {
+        let instance = GetModuleHandleW(std::ptr::null());
+        let dpi = GetDpiForWindow(hwnd).max(96);
+        let sizes = [(ICON_BIG, GCLP_HICON, SM_CXICON), (ICON_SMALL, GCLP_HICONSM, SM_CXSMICON)];
+        for (which, class_slot, metric) in sizes {
+            let size = GetSystemMetricsForDpi(metric, dpi);
+            // Resource id 1, which winresource gives the icon.
+            let icon = LoadImageW(instance, 1 as _, IMAGE_ICON, size, size, 0);
+            if !icon.is_null() {
+                SetClassLongPtrW(hwnd, class_slot, icon as isize);
+                SendMessageW(hwnd, WM_SETICON, which as WPARAM, icon as LPARAM);
+            }
+        }
+    }
+}
+
+/// Restore `hwnd` if minimized and bring it to the front.
+pub fn bring_to_front(hwnd: isize) {
+    let hwnd = hwnd as HWND;
+    unsafe {
+        ShowWindow(hwnd, SW_RESTORE);
+        SetForegroundWindow(hwnd);
+    }
+}
+
 /// Ask the copy that's already running to show its window.
 pub fn show_running_instance() {
-    let (class, title) = (wide("NativeWindowsGuiWindow"), wide(APP_NAME));
+    let class = wide(SESSION_CLASS);
     unsafe {
-        let hwnd = FindWindowW(class.as_ptr(), title.as_ptr());
+        let hwnd = FindWindowW(class.as_ptr(), std::ptr::null());
         if hwnd.is_null() {
             return;
         }

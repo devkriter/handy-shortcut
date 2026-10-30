@@ -39,10 +39,11 @@ fn main() {
     }
 
     let tray_only = std::env::args().any(|a| a == "--tray");
-    nwg::init().expect("Failed to start the Windows UI");
     let app = app::App::build(tray_only).expect("Failed to build the window");
-    nwg::dispatch_thread_events();
+    util::spawn_session_window(|| {
+        let _ = slint::invoke_from_event_loop(app::show_window);
+    });
+    // Keeps running while the window is hidden; Quit in the tray ends it.
+    slint::run_event_loop_until_quit().expect("Failed to run the UI");
     app.shutdown();
 }
-
-use native_windows_gui as nwg;
