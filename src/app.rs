@@ -94,7 +94,6 @@ impl App {
     pub fn build(tray_only: bool) -> Result<Rc<App>, String> {
         let settings = Settings::load();
         let ui = AppWindow::new().map_err(|e| e.to_string())?;
-        ui.set_version(env!("CARGO_PKG_VERSION").into());
         let modes: Vec<SharedString> = Mode::ALL.iter().map(|m| m.label().into()).collect();
         ui.set_modes(ModelRc::new(VecModel::from(modes)));
         let log = Rc::new(VecModel::<LogLine>::default());

@@ -5,7 +5,7 @@ trigger a keyboard shortcut on Windows, such as the Transcribe Shortcut in the
 [Handy](https://handy.computer) speech-to-text app. The button sends nothing
 to the computer, so the app listens for the click it makes in the audio.
 
-<img src="docs/screenshot.png" alt="Handy Shortcut window" width="420">
+<img src="docs/screenshot.png" alt="Handy Shortcut window" width="560">
 
 ## Use
 

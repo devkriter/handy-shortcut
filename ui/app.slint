@@ -1,10 +1,10 @@
 // The settings window, in Slint's Fluent style (follows the Windows light/dark
-// setting). Laid out like Windows 11 Settings: a status header, then cards.
-// All behaviour lives in src/app.rs; this file only binds properties and
-// forwards callbacks.
+// setting). Compact layout: one header row (status, level, Save, Start/Stop),
+// two columns of cards, and the activity list filling the rest. All behaviour
+// lives in src/app.rs; this file only binds properties and forwards callbacks.
 
 import { Button, CheckBox, ComboBox, LineEdit, ListView, Palette, ProgressIndicator,
-         ScrollView, SpinBox, Switch } from "std-widgets.slint";
+         SpinBox, Switch } from "std-widgets.slint";
 
 export struct LogLine {
     time: string,
@@ -25,27 +25,34 @@ global Theme {
     out property <color> orange: dark ? #fce100 : #9d5d00;
     out property <color> red: dark ? #ff99a4 : #c42b1c;
     out property <color> grey: dark ? #9d9d9d : #8a8a8a;
+    out property <length> label-width: 92px;
 }
 
 component Card inherits Rectangle {
     in property <string> title;
-    in property <string> subtitle;
+    // Optional button at the right of the title.
+    in property <string> action;
+    callback action-clicked();
     background: Theme.card-bg;
     border-color: Theme.card-border;
     border-width: 1px;
     border-radius: 8px;
 
     VerticalLayout {
-        padding: 16px;
-        spacing: 12px;
-        VerticalLayout {
-            spacing: 2px;
-            Text { text: root.title; font-size: 14px; font-weight: 600; }
-            if root.subtitle != "": Text {
-                text: root.subtitle;
-                font-size: 12px;
-                color: Theme.secondary;
-                wrap: word-wrap;
+        padding: 12px;
+        padding-top: 10px;
+        spacing: 8px;
+        HorizontalLayout {
+            Text {
+                text: root.title;
+                font-size: 13px;
+                font-weight: 600;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+            }
+            if root.action != "": Button {
+                text: root.action;
+                clicked => { root.action-clicked(); }
             }
         }
         @children
@@ -55,10 +62,10 @@ component Card inherits Rectangle {
 // A label on the left, controls on the right.
 component Row inherits HorizontalLayout {
     in property <string> label;
-    spacing: 12px;
+    spacing: 8px;
     Text {
         text: root.label;
-        width: 128px;
+        width: Theme.label-width;
         vertical-alignment: center;
     }
     @children
@@ -67,12 +74,9 @@ component Row inherits HorizontalLayout {
 export component AppWindow inherits Window {
     title: "Handy Shortcut";
     background: Theme.window-bg;
-    preferred-width: 600px;
-    preferred-height: 780px;
-    min-width: 520px;
-    min-height: 480px;
-
-    in property <string> version;
+    preferred-width: 780px;
+    preferred-height: 600px;
+    min-width: 720px;
 
     // status
     in property <string> status-text: "Stopped";
@@ -108,7 +112,7 @@ export component AppWindow inherits Window {
     callback save();
     // A text or number field changed: just update the Save button.
     callback form-edited();
-    // A checkbox or dropdown changed: apply right away.
+    // A checkbox, switch or dropdown changed: apply right away.
     callback apply-now();
     callback startup-toggled(bool);
     callback open-log();
@@ -117,81 +121,77 @@ export component AppWindow inherits Window {
         log-view.content-y = min(0px, log-view.visible-height - log-view.content-height);
     }
 
-    // Content stays in a centred column (at most 760px) when the window is
-    // wide, like Windows 11 Settings: a spacer either side takes the rest.
     VerticalLayout {
-        // ---- status header ----------------------------------------------
-        HorizontalLayout { Rectangle { } HorizontalLayout {
-            max-width: 760px;
-            horizontal-stretch: 100;
-            padding-left: 24px;
-            padding-right: 24px;
-            padding-top: 20px;
-            padding-bottom: 12px;
-            spacing: 16px;
+        padding: 16px;
+        spacing: 12px;
 
+        // ---- header: status, level, save, start/stop ----------------------
+        HorizontalLayout {
+            spacing: 12px;
+            Rectangle {
+                width: 12px;
+                height: 12px;
+                y: (parent.height - self.height) / 2;
+                border-radius: 6px;
+                background: root.status-kind == 1 ? Theme.green
+                    : root.status-kind == 2 ? Theme.orange
+                    : root.status-kind == 3 ? Theme.red
+                    : Theme.grey;
+            }
+            Text {
+                text: root.status-text;
+                font-size: 20px;
+                font-weight: 600;
+                vertical-alignment: center;
+                overflow: elide;
+                horizontal-stretch: 1;
+            }
             VerticalLayout {
-                spacing: 10px;
                 alignment: center;
-                HorizontalLayout {
-                    spacing: 10px;
-                    Rectangle {
-                        width: 12px;
-                        height: 12px;
-                        y: (parent.height - self.height) / 2;
-                        border-radius: 6px;
-                        background: root.status-kind == 1 ? Theme.green
-                            : root.status-kind == 2 ? Theme.orange
-                            : root.status-kind == 3 ? Theme.red
-                            : Theme.grey;
-                    }
-                    Text {
-                        text: root.status-text;
-                        font-size: 24px;
-                        font-weight: 600;
-                        overflow: elide;
-                    }
-                }
-                HorizontalLayout {
-                    spacing: 12px;
-                    ProgressIndicator { progress: root.level; y: (parent.height - self.height) / 2; }
-                    Text {
-                        text: root.level-text;
-                        width: 64px;
-                        horizontal-alignment: right;
-                        color: Theme.secondary;
-                        font-size: 12px;
-                    }
-                }
+                ProgressIndicator { width: 140px; height: 4px; progress: root.level; }
+            }
+            Text {
+                text: root.level-text;
+                width: 60px;
+                horizontal-alignment: right;
+                vertical-alignment: center;
+                color: Theme.secondary;
+                font-size: 12px;
+            }
+            Button {
+                text: "Save";
+                primary: root.dirty;
+                enabled: root.dirty;
+                width: 80px;
+                clicked => { root.save(); }
             }
             Button {
                 text: root.listening ? "Stop" : "Start";
-                primary: !root.listening;
-                width: 96px;
-                height: 36px;
-                y: (parent.height - self.height) / 2;
+                primary: !root.listening && !root.dirty;
+                width: 80px;
                 clicked => { root.toggle-listening(); }
             }
-        } Rectangle { } }
+        }
 
-        // ---- settings ---------------------------------------------------
-        ScrollView {
-            vertical-stretch: 1;
-            HorizontalLayout { Rectangle { } VerticalLayout {
-                max-width: 760px;
-                horizontal-stretch: 100;
-                alignment: start;
-                padding-left: 24px;
-                padding-right: 24px;
-                padding-top: 4px;
-                padding-bottom: 16px;
+        if root.form-error != "": Text {
+            text: root.form-error;
+            color: Theme.red;
+            wrap: word-wrap;
+        }
+
+        // ---- settings, two columns -----------------------------------------
+        HorizontalLayout {
+            spacing: 12px;
+
+            VerticalLayout {
                 spacing: 12px;
+                horizontal-stretch: 1;
+                alignment: start;
 
                 Card {
                     title: "Shortcut";
-                    subtitle: "What to press when the button on the microphone goes down.";
                     Row {
-                        label: "Shortcut";
+                        label: "Keys";
                         LineEdit {
                             text <=> root.hotkey;
                             read-only: root.recording;
@@ -201,12 +201,12 @@ export component AppWindow inherits Window {
                         }
                         Button {
                             text: root.recording ? "Cancel" : "Record";
-                            width: 88px;
+                            width: 76px;
                             clicked => { root.record(); }
                         }
                     }
                     Row {
-                        label: "Button action";
+                        label: "Action";
                         ComboBox {
                             model: root.modes;
                             current-index <=> root.mode-index;
@@ -214,9 +214,9 @@ export component AppWindow inherits Window {
                         }
                     }
                     Row {
-                        label: "After release";
+                        label: "Then";
                         CheckBox {
-                            text: "Press Enter after";
+                            text: "Enter after";
                             checked <=> root.enter-after;
                             toggled => { root.apply-now(); }
                         }
@@ -226,7 +226,7 @@ export component AppWindow inherits Window {
                             maximum: 10000;
                             step-size: 100;
                             enabled: root.enter-after;
-                            width: 120px;
+                            width: 104px;
                             edited => { root.form-edited(); }
                         }
                         Text { text: "ms"; vertical-alignment: center; color: Theme.secondary; }
@@ -243,8 +243,10 @@ export component AppWindow inherits Window {
                             selected => { root.apply-now(); }
                         }
                         Button {
-                            text: "Refresh";
-                            width: 88px;
+                            icon: @image-url("refresh.svg");
+                            colorize-icon: true;
+                            accessible-label: "Refresh microphones";
+                            width: 36px;
                             clicked => { root.refresh-devices(); }
                         }
                     }
@@ -254,17 +256,18 @@ export component AppWindow inherits Window {
                             value <=> root.channel;
                             minimum: 1;
                             maximum: 32;
-                            width: 120px;
+                            width: 104px;
                             edited => { root.form-edited(); }
                         }
                         Rectangle { }
                     }
-                    Switch {
-                        text: "Swap press and release (if they come out backwards)";
-                        checked <=> root.invert;
-                        toggled => { root.apply-now(); }
-                    }
                 }
+            }
+
+            VerticalLayout {
+                spacing: 12px;
+                horizontal-stretch: 1;
+                alignment: start;
 
                 Card {
                     title: "Startup";
@@ -282,106 +285,81 @@ export component AppWindow inherits Window {
 
                 Card {
                     title: "Thump detection";
-                    subtitle: "Your button's thumps: peak 1.00, width about 2.7 ms. Ignored spikes in the activity list show what speech looks like.";
                     Row {
-                        label: "Min peak (0-1)";
+                        label: "Min peak";
                         LineEdit {
                             text <=> root.peak-min;
                             input-type: decimal;
-                            width: 96px;
+                            width: 64px;
                             edited => { root.form-edited(); }
                             accepted => { root.save(); }
                         }
-                        Text { text: "Min width (ms)"; vertical-alignment: center; }
+                        Text { text: "Min width"; vertical-alignment: center; }
                         LineEdit {
                             text <=> root.width-ms;
                             input-type: decimal;
-                            width: 96px;
+                            width: 64px;
                             edited => { root.form-edited(); }
                             accepted => { root.save(); }
                         }
+                        Text { text: "ms"; vertical-alignment: center; color: Theme.secondary; }
                         Rectangle { }
                     }
-                }
-
-                Card {
-                    title: "Activity";
-                    Rectangle {
-                        height: 200px;
-                        background: Palette.control-background;
-                        border-color: Theme.card-border;
-                        border-width: 1px;
-                        border-radius: 4px;
-                        clip: true;
-                        log-view := ListView {
-                            for line in root.log: HorizontalLayout {
-                                padding-left: 10px;
-                                padding-right: 10px;
-                                padding-top: 2px;
-                                padding-bottom: 2px;
-                                spacing: 10px;
-                                Text {
-                                    text: line.time;
-                                    width: 60px;
-                                    font-family: "Cascadia Mono";
-                                    font-size: 12px;
-                                    color: Theme.secondary;
-                                }
-                                Text {
-                                    text: line.text;
-                                    font-family: "Cascadia Mono";
-                                    font-size: 12px;
-                                    overflow: elide;
-                                    color: line.kind == 1 ? Theme.green
-                                        : line.kind == 2 ? Theme.blue
-                                        : line.kind == 3 ? Theme.grey
-                                        : line.kind == 4 ? Theme.orange
-                                        : line.kind == 5 ? Theme.red
-                                        : Palette.foreground;
-                                }
-                            }
-                        }
+                    Switch {
+                        text: "Swap press and release";
+                        checked <=> root.invert;
+                        toggled => { root.apply-now(); }
                     }
-                    HorizontalLayout {
-                        Text {
-                            text: "Handy Shortcut " + root.version;
-                            color: Theme.secondary;
-                            font-size: 12px;
-                            vertical-alignment: center;
-                        }
-                        Rectangle { }
-                        Button {
-                            text: "Open log file";
-                            clicked => { root.open-log(); }
-                        }
+                    Text {
+                        text: "Button thumps: peak 1.00, about 2.7 ms wide.";
+                        font-size: 12px;
+                        color: Theme.secondary;
                     }
                 }
-            } Rectangle { } }
+            }
         }
 
-        // ---- footer: save ----------------------------------------------
-        Rectangle {
-            background: Theme.card-bg;
-            Rectangle { y: 0; height: 1px; background: Theme.card-border; }
-            HorizontalLayout {
-                padding-left: 24px;
-                padding-right: 24px;
-                padding-top: 12px;
-                padding-bottom: 12px;
-                spacing: 12px;
-                Text {
-                    text: root.form-error != "" ? root.form-error
-                        : root.dirty ? "You have unsaved changes." : "All changes saved.";
-                    color: root.form-error != "" ? Theme.red : Theme.secondary;
-                    vertical-alignment: center;
-                    wrap: word-wrap;
-                }
-                Button {
-                    text: "Save";
-                    primary: true;
-                    enabled: root.dirty;
-                    width: 96px;
-                    clicked => { root.save(); }
+        // ---- activity, fills the rest ---------------------------------------
+        Card {
+            title: "Activity";
+            action: "Open log file";
+            action-clicked => { root.open-log(); }
+            vertical-stretch: 1;
+            min-height: 150px;
+            Rectangle {
+                vertical-stretch: 1;
+                background: Palette.control-background;
+                border-color: Theme.card-border;
+                border-width: 1px;
+                border-radius: 4px;
+                clip: true;
+                log-view := ListView {
+                    for line in root.log: HorizontalLayout {
+                        padding-left: 10px;
+                        padding-right: 10px;
+                        padding-top: 2px;
+                        padding-bottom: 2px;
+                        spacing: 10px;
+                        Text {
+                            text: line.time;
+                            width: 60px;
+                            font-family: "Cascadia Mono";
+                            font-size: 12px;
+                            color: Theme.secondary;
+                        }
+                        Text {
+                            text: line.text;
+                            font-family: "Cascadia Mono";
+                            font-size: 12px;
+                            overflow: elide;
+                            color: line.kind == 1 ? Theme.green
+                                : line.kind == 2 ? Theme.blue
+                                : line.kind == 3 ? Theme.grey
+                                : line.kind == 4 ? Theme.orange
+                                : line.kind == 5 ? Theme.red
+                                : Palette.foreground;
+                        }
+                    }
                 }
             }
         }
